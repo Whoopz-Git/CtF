@@ -126,6 +126,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         _isServer = server;
         // Currently Hard Coded. Config driven later.
         CtFLogger.SetEnabled(true);
+        CommandExecutor.SetServerState(server);
 
         if (!server)
         {
@@ -136,8 +137,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
     public void OnPlayerJoined(int playerId, ulong steamId, string name, string regimentTag, bool isBot)
     {
-        if (!_isServer) return;
-
         var player = new PlayerState
         {
             PlayerId = playerId,
@@ -210,9 +209,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
     public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject, InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex)
     {
-        if (!_isServer)
-            return;
-
         // Only care about the end of an interaction (flag actually picked up).
         if (interactionActivationType != InteractionActivationType.EndInteraction)
             return;
@@ -238,8 +234,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
     public void OnPlayerEndCarry(int playerId)
     {
-        if (!_isServer) return;
-
         CtFLogger.Log("OnPlayerEndCarry");
 
         foreach (var flag in _flags)
@@ -437,6 +431,11 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         if (winner == FactionCountry.None) return;
         CtFLogger.Log($"SetRoundWinner: {winner} won the round");
         CommandExecutor.ExecuteCommand(string.Format("set roundEndFactionWin {0} None", winner));
+    }
+
+    public bool getIsServer()
+    {
+        return _isServer;
     }
 
     public void PassConfigVariables(string[] value)

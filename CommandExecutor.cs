@@ -8,6 +8,12 @@ namespace CtF
     public static class CommandExecutor
     {
         private static InputField consoleInputField;
+        private static bool _isServer;
+
+        public static void SetServerState(bool isServer)
+        {
+            _isServer = isServer;
+        }
 
         // Locate the console input field in the UI
         public static void InitializeConsole()
@@ -38,6 +44,11 @@ namespace CtF
             if (consoleInputField == null)
             {
                 CtFLogger.Error("Cannot execute command - Console Input Field is null.");
+                return;
+            }
+            if (!_isServer)
+            {
+                CtFLogger.Log($"Server side command fired: {command}");
                 return;
             }
             consoleInputField.onEndEdit.Invoke(command);
