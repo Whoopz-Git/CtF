@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using HoldfastSharedMethods;
 using UnityEngine;
-using UnityEngine.UI;
 using CtF;
 
 public class CaptureTheFlag : IHoldfastSharedMethods
@@ -20,7 +19,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
     private FactionCountry _defendingFaction = FactionCountry.None;
 
     // Players by id
-    private readonly Dictionary<int, PlayerInfo> _players = new Dictionary<int, PlayerInfo>(256);
+    //private readonly Dictionary<int, PlayerInfo> _players = new Dictionary<int, PlayerInfo>(256);
 
     // Flags indexed both ways for fast lookup
     private readonly Dictionary<GameObject, FlagState> _flagsByObject = new Dictionary<GameObject, FlagState>(8);
@@ -55,6 +54,27 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         };
 
     //Data Types
+
+    private readonly Dictionary<int, PlayerState> _players = new Dictionary<int, PlayerState>();
+
+    private class PlayerState
+    {
+        // From OnPlayerJoined
+        public int PlayerId;
+        public ulong SteamId;
+        public string Name;
+        public string RegimentTag;
+        public bool IsBot;
+
+        // From OnPlayerSpawned
+        public GameObject PlayerObject;
+        public int SpawnSectionId;
+        public FactionCountry Faction;
+        public PlayerClass PlayerClass;
+        public int UniformId;
+    }
+
+
 
     private sealed class PlayerInfo
     {
@@ -121,6 +141,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         CommandExecutor.InitializeConsole();
     }
 
+    /*
     public void OnPlayerJoined(int playerId, ulong steamId, string name, string regimentTag, bool isBot)
     {
         if (!_isServer) return;
@@ -133,28 +154,56 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             Faction = FactionCountry.None
         };
     }
+    */
 
-    public void OnPlayerSpawned(int playerId, int spawnSectionId, FactionCountry playerFaction, PlayerClass playerClass,
-        int uniformId, GameObject playerObject)
+    public void OnPlayerJoined(int playerId, ulong steamId, string name, string regimentTag, bool isBot)
     {
         if (!_isServer) return;
 
-        PlayerInfo info;
-        if (!_players.TryGetValue(playerId, out info))
+        var player = new PlayerState
         {
-            // Handle spawn before join (rare, but safer)
-            info = new PlayerInfo { PlayerId = playerId };
-            _players[playerId] = info;
+            PlayerId = playerId,
+            SteamId = steamId,
+            Name = name,
+            RegimentTag = regimentTag,
+            IsBot = isBot,
+
+            PlayerObject = null,
+            SpawnSectionId = -1,
+            Faction = FactionCountry.None,
+            PlayerClass = PlayerClass.None,
+            UniformId = -1
+        };
+
+        _players[playerId] = player;
+    }
+
+
+    public void OnPlayerSpawned(int playerId, int spawnSectionId, FactionCountry playerFaction, PlayerClass playerClass, int uniformId, GameObject playerObject)
+    {
+        PlayerState player;
+        if (!_players.TryGetValue(playerId, out player))
+        {
+            player = new PlayerState
+            {
+                PlayerId = playerId,
+                SteamId = 0UL,
+                Name = string.Empty,
+                RegimentTag = string.Empty,
+                IsBot = false
+            };
+            _players[playerId] = player;
         }
 
-        info.Faction = playerFaction;
-        info.PlayerObject = playerObject;
+        player.PlayerObject = playerObject;
+        player.SpawnSectionId = spawnSectionId;
+        player.Faction = playerFaction;
+        player.PlayerClass = playerClass;
+        player.UniformId = uniformId;
     }
 
     public void OnPlayerLeft(int playerId)
     {
-        if (!_isServer) return;
-
         _players.Remove(playerId);
     }
 
@@ -178,30 +227,31 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         Debug.Log("CTF map: " + mapName);
     }
 
-    public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject,
-        InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex)
+    public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject, InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex)
     {
-        if (!_isServer) return;
-
-        // Prefer direct enum compare keep ToString fallback if you’re unsure of exact enum member names.
-        // if (interactionActivationType != InteractionActivationType.EndInteraction) return;
-        if (!string.Equals(interactionActivationType.ToString(), "EndInteraction", StringComparison.Ordinal))
+        if (!_isServer)
             return;
 
-        FlagState flag;
-        if (!_flagsByObject.TryGetValue(interactableObject, out flag))
+        // Only care about the end of an interaction (flag actually picked up).
+        if (interactionActivationType != InteractionActivationType.EndInteraction)
             return;
 
+        // Is this one of our tracked flags?
+        if (!_flagsByObject.TryGetValue(interactableObject, out var flag))
+            return;
+
+        // Remember who picked it up.
         flag.CarrierPlayerId = playerId;
 
-        // If enemy picked it up, broadcast capture.
-        PlayerInfo p;
-        if (_players.TryGetValue(playerId, out p) && p.Faction != FactionCountry.None && p.Faction != flag.FlagFaction)
+        // If the carrier is from the enemy faction, announce the capture.
+        if (_players.TryGetValue(playerId, out var player) &&
+            player.Faction != FactionCountry.None &&
+            player.Faction != flag.FlagFaction)
         {
-            Broadcast(string.Format("The {0} flag has been captured!", flag.FlagFaction));
+            Broadcast($"The {flag.FlagFaction} flag has been captured!");
         }
 
-        // Picking it up cancels any “in enemy base” countdown
+        // Picking up the flag cancels any "flag in enemy base" countdown.
         CancelEnemyBaseCountdown(flag);
     }
 
