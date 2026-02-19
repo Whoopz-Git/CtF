@@ -234,8 +234,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
     public void OnPlayerEndCarry(int playerId)
     {
-        CtFLogger.Log("OnPlayerEndCarry");
-
         foreach (var flag in _flags)
         {
             // Only care about the flag that this player was carrying
@@ -266,9 +264,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             }
             else
             {
-                // If you want dropping the flag outside the base to cancel a running countdown,
-                // uncomment this:
-                // CancelEnemyBaseCountdown(flag);
+                CancelBaseCountdown(flag);
             }
         }
     }
