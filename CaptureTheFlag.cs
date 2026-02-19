@@ -25,7 +25,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
     private readonly Dictionary<FactionCountry, BaseZone> _basesByFaction = new Dictionary<FactionCountry, BaseZone>(8);
 
     // Mapping from faction flag object name in scene
-    private static readonly Dictionary<FactionCountry, string> FlagObjectName = new Dictionary<FactionCountry, string>
+    private readonly Dictionary<FactionCountry, string> _flagObjectName =new Dictionary<FactionCountry, string>
     {
         {FactionCountry.British,  "Flag_British_Interactable"},
         {FactionCountry.French,   "Flag_French_Interactable"},
@@ -334,7 +334,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             return;
 
         string objectName;
-        if (!FlagObjectName.TryGetValue(faction, out objectName) || string.IsNullOrEmpty(objectName))
+        if (!_flagObjectName.TryGetValue(faction, out objectName) || string.IsNullOrEmpty(objectName))
         {
             CtFLogger.Warn($"TryRegisterFlag: no flag object mapping for faction {faction}.");
             return;
