@@ -1,629 +1,491 @@
-using System.Collections;
+using System;
 using System.Collections.Generic;
-using UnityEngine;
 using HoldfastSharedMethods;
-using UnityEngine.UI;
+using UnityEngine;
+using CtF;
 
 public class CaptureTheFlag : IHoldfastSharedMethods
 {
-    private InputField f1MenuInputField;
-    public List<playerInfo> playerList = new List<playerInfo>();
-    public List<captureFlags> flagList = new List<captureFlags>();
-    public List<spawnObjects> spawnList = new List<spawnObjects>();
-    public GameObject spawn1 = new GameObject();
-    public GameObject spawn2 = new GameObject();
-    public float timer;
-    public float timeelapsed;
+    // Make Config Driven Later
+    private const int BaseHoldSeconds = 60;
+    private const int WarningSeconds = 30;
+    private const float BaseRadius = 30f;
 
-    public class playerInfo
+    private bool _isServer;
+    private int _elapsedSeconds;
+
+    private RoundInfo _roundDetails;
+    private readonly Dictionary<int, PlayerState> _players = new Dictionary<int, PlayerState>();
+
+    // Flags indexed both ways for fast lookup
+    private readonly List<FlagState> _flags = new List<FlagState>();
+    private readonly Dictionary<GameObject, FlagState> _flagsByObject = new Dictionary<GameObject, FlagState>(8);
+
+    // “Bases” / capture zones per faction for this round (map-specific)
+    private readonly Dictionary<FactionCountry, BaseZone> _basesByFaction = new Dictionary<FactionCountry, BaseZone>(8);
+
+    // Mapping from faction flag object name in scene
+    private readonly Dictionary<FactionCountry, string> _flagObjectName =new Dictionary<FactionCountry, string>
     {
-        public int pId;
-        public ulong pSId;
-        public GameObject pObj;
-        public string faction;
+        {FactionCountry.British,  "Flag_British_Interactable"},
+        {FactionCountry.French,   "Flag_French_Interactable"},
+        {FactionCountry.Prussian, "Flag_Prussian_Interactable"},
+        {FactionCountry.Russian,  "Flag_Russian_Interactable"},
+        {FactionCountry.Italian,  "Flag_Italian_Interactable"},
+        {FactionCountry.Austrian, "Flag_Austrian_Interactable"},
+    };
+
+    // Hard Coded Map configs
+    private readonly Dictionary<string, MapConfig> _mapConfigs = new Dictionary<string, MapConfig>(StringComparer.OrdinalIgnoreCase)
+    {
+         {
+             "ChampsdAmbre",
+             new MapConfig(
+                 attackingBase: new Vector3(4.0f, 13.71f, -195.0f),
+                 defendingBase: new Vector3(-0.5f, 13.71f, 230.0f),
+                 radius: 30f
+             )
+         }
+    };
+
+    // Data Types
+    private class PlayerState
+    {
+        // From OnPlayerJoined
+        public int PlayerId;
+        public ulong SteamId;
+        public string Name;
+        public string RegimentTag;
+        public bool IsBot;
+
+        // From OnPlayerSpawned
+        public GameObject PlayerObject;
+        public int SpawnSectionId;
+        public FactionCountry Faction;
+        public PlayerClass PlayerClass;
+        public int UniformId;
     }
 
-    public class captureFlags
+    private sealed class RoundInfo
     {
-        public GameObject flagObj;
-        public string flagFaction;
-        public int flagPlayerId;
-        public float endTime;
-        public int callTimer;
+        public int RoundId;
+        public string ServerName;
+        public string MapName;
+        public GameplayMode GameplayMode;
+        public GameType GameType;
+        public FactionCountry AttackingFaction;
+        public FactionCountry DefendingFaction;
     }
 
-    public class spawnObjects
+    private enum FlagCountdownState
     {
-        public GameObject spawn;
-        public string spawnFaction;
+        None = 0,
+        CountdownActive = 1,
+        RoundEnded = 2
+    }
+
+    private sealed class FlagState
+    {
+        public FactionCountry FlagFaction;
+        public GameObject FlagObject;
+
+        public int CarrierPlayerId; // 0 means none/unknown
+        public int baseDeadlineTime; // 0 means inactive
+        public bool WarningSent;
+        public FlagCountdownState CountdownState = FlagCountdownState.None;
+    }
+
+    private struct BaseZone
+    {
+        public Vector3 Center;
+        public float Radius;
+
+        public BaseZone(Vector3 center, float radius)
+        {
+            Center = center;
+            Radius = radius;
+        }
+    }
+
+    private readonly struct MapConfig
+    {
+        public readonly Vector3 AttackingBase;
+        public readonly Vector3 DefendingBase;
+        public readonly float Radius;
+
+        public MapConfig(Vector3 attackingBase, Vector3 defendingBase, float radius)
+        {
+            AttackingBase = attackingBase;
+            DefendingBase = defendingBase;
+            Radius = radius;
+        }
+    }
+
+    public void OnIsServer(bool server)
+    {
+        _isServer = server;
+        // Currently Hard Coded. Config driven later.
+        CtFLogger.SetEnabled(true);
+        CommandExecutor.SetServerState(server);
+
+        if (!server)
+        {
+            return;
+        }
+        CommandExecutor.InitializeConsole();
     }
 
     public void OnPlayerJoined(int playerId, ulong steamId, string name, string regimentTag, bool isBot)
     {
-        playerInfo newPlayer = new playerInfo();
+        var player = new PlayerState
+        {
+            PlayerId = playerId,
+            SteamId = steamId,
+            Name = name,
+            RegimentTag = regimentTag,
+            IsBot = isBot,
 
-        newPlayer.pId = playerId;
-        newPlayer.pSId = steamId;
-        newPlayer.pObj = null;
-        newPlayer.faction = "";
+            PlayerObject = null,
+            SpawnSectionId = -1,
+            Faction = FactionCountry.None,
+            PlayerClass = PlayerClass.None,
+            UniformId = -1
+        };
 
-        playerList.Add(newPlayer);
+        _players[playerId] = player;
     }
+
 
     public void OnPlayerSpawned(int playerId, int spawnSectionId, FactionCountry playerFaction, PlayerClass playerClass, int uniformId, GameObject playerObject)
     {
-        for (int x = 0; x < playerList.Count; x++)
+        PlayerState player;
+        if (!_players.TryGetValue(playerId, out player))
         {
-            if (playerList[x].pId == playerId)
+            player = new PlayerState
             {
-                playerList[x].faction = playerFaction.ToString();
-                playerList[x].pObj = playerObject;
-            }
+                PlayerId = playerId,
+                SteamId = 0UL,
+                Name = string.Empty,
+                RegimentTag = string.Empty,
+                IsBot = false
+            };
+            _players[playerId] = player;
         }
+
+        player.PlayerObject = playerObject;
+        player.SpawnSectionId = spawnSectionId;
+        player.Faction = playerFaction;
+        player.PlayerClass = playerClass;
+        player.UniformId = uniformId;
     }
 
     public void OnPlayerLeft(int playerId)
     {
-        for (int x = 0; x < playerList.Count; x++)
-        {
-            if (playerList[x].pId == playerId)
-            {
-                playerList.Remove(playerList[x]);
-            }
-        }
-    }
-
-    public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject, InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex)
-    {
-
-        for(int x = 0; x < flagList.Count; x++)
-        {
-            if (interactableObject == flagList[x].flagObj)
-            {
-                if (interactionActivationType.ToString() == "EndInteraction")
-                {
-                    Debug.Log(flagList[x].flagFaction + " flag picked up.");
-                    flagList[x].flagPlayerId = playerId;
-
-                    Debug.Log("Flag picked up by " + playerId);
-
-                    for(int y = 0; y < playerList.Count; y++)
-                    {
-                        if (playerList[y].pId == flagList[x].flagPlayerId)
-                        {
-                            if(flagList[x].flagFaction != playerList[y].faction)
-                            {
-                                var flagPickedUp = string.Format("broadcast The {0} flag has been captured!", flagList[x].flagFaction);
-                                f1MenuInputField.onEndEdit.Invoke(flagPickedUp);
-                            }
-                        }
-                    }
-
-                    if(flagList[x].endTime != -1)
-                    {
-                        flagList[x].endTime = -1;
-                    }
-                }
-            }
-        }
+        _players.Remove(playerId);
     }
 
     public void OnRoundDetails(int roundId, string serverName, string mapName, FactionCountry attackingFaction, FactionCountry defendingFaction, GameplayMode gameplayMode, GameType gameType)
     {
-        spawnObjects spawn1 = new spawnObjects();
-        spawn1.spawn = new GameObject();
-        spawn1.spawnFaction = attackingFaction.ToString();
-        spawnList.Add(spawn1);
+        ResetRoundState();
 
-        spawnObjects spawn2 = new spawnObjects();
-        spawn2.spawn = new GameObject();
-        spawn2.spawnFaction = defendingFaction.ToString();
-        spawnList.Add(spawn2);
-
-
-        if (attackingFaction.ToString() == "British")
+        _roundDetails = new RoundInfo
         {
-            captureFlags newFlag = new captureFlags();
+            RoundId = roundId,
+            ServerName = serverName,
+            MapName = mapName,
+            GameplayMode = gameplayMode,
+            GameType = gameType,
+            AttackingFaction = attackingFaction,
+            DefendingFaction = defendingFaction
+        };
 
-            newFlag.flagFaction = "British";
-            newFlag.flagObj = GameObject.Find("Flag_British_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
+        // Register the two flags for the round
+        TryRegisterFlag(attackingFaction);
+        TryRegisterFlag(defendingFaction);
 
-            flagList.Add(newFlag);
-            Debug.Log("Attacking flag added: UK");
-        }
-        if (attackingFaction.ToString() == "French")
+        // Configure bases for this map (attacking/defending only)
+        SetupBasesForMap(mapName, attackingFaction, defendingFaction);
+    }
+
+    public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject, InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex)
+    {
+        // Only care about the end of an interaction (flag actually picked up).
+        if (interactionActivationType != InteractionActivationType.EndInteraction)
+            return;
+
+        // Is this one of our tracked flags?
+        if (!_flagsByObject.TryGetValue(interactableObject, out var flag))
+            return;
+
+        // Remember who picked it up.
+        flag.CarrierPlayerId = playerId;
+
+        // If the carrier is from the enemy faction, announce the capture.
+        if (_players.TryGetValue(playerId, out var player) &&
+            player.Faction != FactionCountry.None &&
+            player.Faction != flag.FlagFaction)
         {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "French";
-            newFlag.flagObj = GameObject.Find("Flag_French_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Attacking flag added: FR");
-        }
-        if (attackingFaction.ToString() == "Prussian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Prussian";
-            newFlag.flagObj = GameObject.Find("Flag_Prussian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Attacking flag added: PR");
-        }
-        if (attackingFaction.ToString() == "Russian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Russian";
-            newFlag.flagObj = GameObject.Find("Flag_Russian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Attacking flag added: RU");
-        }
-        if (attackingFaction.ToString() == "Italian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Italian";
-            newFlag.flagObj = GameObject.Find("Flag_Italian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Attacking flag added: IT");
-        }
-        if (attackingFaction.ToString() == "Austrian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Austrian";
-            newFlag.flagObj = GameObject.Find("Flag_Austrian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Attacking flag added: AU");
+            Broadcast($"The {flag.FlagFaction} flag has been captured!");
         }
 
-        if (defendingFaction.ToString() == "British")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "British";
-            newFlag.flagObj = GameObject.Find("Flag_British_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Defending flag added: UK");
-        }
-        if (defendingFaction.ToString() == "French")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "French";
-            newFlag.flagObj = GameObject.Find("Flag_French_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Defending flag added: FR");
-        }
-        if (defendingFaction.ToString() == "Prussian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Prussian";
-            newFlag.flagObj = GameObject.Find("Flag_Prussian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Defending flag added: PR");
-        }
-        if (defendingFaction.ToString() == "Russian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Russian";
-            newFlag.flagObj = GameObject.Find("Flag_Russian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Defending flag added: RU");
-        }
-        if (defendingFaction.ToString() == "Italian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Italian";
-            newFlag.flagObj = GameObject.Find("Flag_Italian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Defending flag added: IT");
-        }
-        if (defendingFaction.ToString() == "Austrian")
-        {
-            captureFlags newFlag = new captureFlags();
-
-            newFlag.flagFaction = "Austrian";
-            newFlag.flagObj = GameObject.Find("ww1_Flag_Australian_Interactable");
-            newFlag.flagPlayerId = 0;
-            newFlag.endTime = -1;
-            newFlag.callTimer = 0;
-
-            flagList.Add(newFlag);
-            Debug.Log("Defending flag added: AU");
-        }
-
-        Debug.Log(mapName);
-        switch (mapName)
-        {
-            case "ChampsdAmbre":
-                Debug.Log("In ChampsdAmbre");
-
-                spawnList[0].spawn.transform.position = new Vector3(4.0f, 13.71f, -195.0f);
-                spawnList[0].spawn.transform.localScale = new Vector3(30, 30, 30);
-
-                spawnList[0].spawn.SetActive(false);
-
-                spawnList[1].spawn.transform.position = new Vector3(-0.5f, 13.71f, 230.0f);
-                spawnList[1].spawn.transform.localScale = new Vector3(30, 30, 30);
-
-                spawnList[1].spawn.SetActive(false);
-                break;
-
-            default:
-
-                break;
-        }
+        // Picking up the flag cancels any "flag in enemy base" countdown.
+        CancelBaseCountdown(flag);
     }
 
     public void OnPlayerEndCarry(int playerId)
     {
-        Debug.Log("In OnPlayerEndCarry");
-
-        timer = 60.0f;
-
-        for (int x = 0; x < flagList.Count; x++)
+        foreach (var flag in _flags)
         {
-            for (int y = 0; y < spawnList.Count; y++)
+            // Only care about the flag that this player was carrying
+            if (flag.CarrierPlayerId != playerId)
+                continue;
+
+            // Determine which faction is the enemy for this flag
+            var enemyFaction = GetOpponentFaction(flag.FlagFaction);
+            if (enemyFaction == FactionCountry.None)
             {
-                Debug.Log(flagList[x].flagFaction + " " + spawnList[y].spawnFaction);
+                CtFLogger.Warn($"OnPlayerEndCarry: could not resolve enemy faction for {flag.FlagFaction}");
+                continue;
+            }
 
-                if (flagList[x].flagFaction != spawnList[y].spawnFaction)
-                {
-                    Debug.Log(flagList[x].flagPlayerId + " " + playerId);
-                    if (flagList[x].flagPlayerId == playerId)
-                    {
-                        Debug.Log(flagList[x].flagObj.transform.position.x + " " + spawnList[y].spawn.transform.position.x);
-                        if (Mathf.Abs(flagList[x].flagObj.transform.position.x - spawnList[y].spawn.transform.position.x) < 30)
-                        {
-                            Debug.Log(flagList[x].flagObj.transform.position.z + " " + spawnList[y].spawn.transform.position.z);
-                            if (Mathf.Abs(flagList[x].flagObj.transform.position.z - spawnList[y].spawn.transform.position.z) < 30)
-                            {
-                                Debug.Log("The " + flagList[x].flagFaction + " flag is in enemy spawn.");
+            // Get the enemy base zone
+            if (!_basesByFaction.TryGetValue(enemyFaction, out var enemyBase))
+            {
+                CtFLogger.Warn($"OnPlayerEndCarry: no base configured for enemy faction {enemyFaction} on map '{_roundDetails?.MapName ?? "unknown"}'.");
+                continue;
+            }
 
-                                var flagInSpawn = string.Format("broadcast The {0} flag is in the enemy spawn! You have {1} seconds to get it out.", flagList[x].flagFaction, timer);
-                                f1MenuInputField.onEndEdit.Invoke(flagInSpawn);
+            var flagPos = flag.FlagObject.transform.position;
 
-                                flagList[x].endTime = timeelapsed + timer;
-                                Debug.Log(flagList[x].endTime);
-                            }
-                        }
-                    }
-                }
+            if (IsWithinBaseXZ(flagPos, enemyBase))
+            {
+                CtFLogger.Log($"The {flag.FlagFaction} flag is in enemy base ({enemyFaction}).");
+                StartBaseCountdown(flag, BaseHoldSeconds);
+            }
+            else
+            {
+                CancelBaseCountdown(flag);
             }
         }
     }
 
     public void OnUpdateElapsedTime(float time)
     {
-        timeelapsed = Mathf.Floor(time);
+        _elapsedSeconds = (int)time;
 
-        string fact1 = flagList[0].flagFaction;
-        string fact2 = flagList[1].flagFaction;
-
-        for (int x = 0; x < flagList.Count; x++)
+        foreach (var flag in _flags)
         {
-            if(Mathf.Floor(time) == flagList[x].endTime - 15.0 && flagList[x].callTimer == 0)
-            {
-                Debug.Log("15 second warning");
+            // No countdown active
+            if (flag.baseDeadlineTime <= 0)
+                continue;
 
-                var endRoundFromFlag = string.Format("broadcast The {0} flag is in the enemy spawn! You have 15 seconds to get it out.", flagList[x].flagFaction);
-                f1MenuInputField.onEndEdit.Invoke(endRoundFromFlag);
-                flagList[x].callTimer = 1;
+            if (flag.CountdownState != FlagCountdownState.CountdownActive)
+                continue;
+
+            int remaining = flag.baseDeadlineTime - _elapsedSeconds;
+
+            // 15-second warning
+            if (!flag.WarningSent && remaining == WarningSeconds)
+            {
+                Broadcast($"The {flag.FlagFaction} flag is in the enemy spawn! You have {WarningSeconds} seconds to get it out.");
+                flag.WarningSent = true;
             }
 
-
-            if (flagList[x].endTime == Mathf.Floor(time) && flagList[x].callTimer == 1)
+            // Time expired: end round
+            if (_elapsedSeconds >= flag.baseDeadlineTime)
             {
-                Debug.Log("endTime is equal to time");
+                CtFLogger.Log("Flag base countdown reached deadline; ending round.");
 
-                if (flagList[x].flagFaction == fact1)
+                var winner = GetOpponentFaction(flag.FlagFaction);
+                if (winner != FactionCountry.None)
                 {
-                    var endRoundFromFlag = string.Format("set roundEndFactionWin {0} None", fact2);
-                    f1MenuInputField.onEndEdit.Invoke(endRoundFromFlag);
-
-                    flagList[x].callTimer = 2;
+                    SetRoundWinner(winner);
                 }
                 else
                 {
-                    {
-                        var endRoundFromFlag = string.Format("set roundEndFactionWin {0} None", fact1);
-                        f1MenuInputField.onEndEdit.Invoke(endRoundFromFlag);
-
-                        flagList[x].callTimer = 2;
-                    }
+                    CtFLogger.Warn($"OnUpdateElapsedTime: could not determine opponent faction for {flag.FlagFaction}");
                 }
+
+                flag.CountdownState = FlagCountdownState.RoundEnded;
             }
         }
+    }
+
+    //Helpers
+    private void ResetRoundState()
+    {
+        _elapsedSeconds = 0;
+
+        _flags.Clear();
+        _flagsByObject.Clear();
+        _basesByFaction.Clear();
+
+        _roundDetails = null;
+    }
+
+
+    private void TryRegisterFlag(FactionCountry faction)
+    {
+        if (faction == FactionCountry.None)
+            return;
+
+        string objectName;
+        if (!_flagObjectName.TryGetValue(faction, out objectName) || string.IsNullOrEmpty(objectName))
+        {
+            CtFLogger.Warn($"TryRegisterFlag: no flag object mapping for faction {faction}.");
+            return;
+        }
+
+        var flagObj = GameObject.Find(objectName);
+        if (flagObj == null)
+        {
+            var mapName = _roundDetails != null ? _roundDetails.MapName : "unknown";
+            CtFLogger.Warn( $"TryRegisterFlag: could not find flag object '{objectName}' for faction {faction} on map '{mapName}'.");
+            return;
+        }
+
+        var flag = new FlagState
+        {
+            FlagFaction = faction,
+            FlagObject = flagObj,
+            CarrierPlayerId = 0,
+            baseDeadlineTime = 0,
+            WarningSent = false,
+            CountdownState = FlagCountdownState.None
+        };
+
+        _flags.Add(flag);
+        _flagsByObject[flagObj] = flag;
+
+        CtFLogger.Log($"TryRegisterFlag: registered flag for faction {faction} (object '{objectName}').");
+    }
+
+    private void SetupBasesForMap(string mapName, FactionCountry attackingFaction, FactionCountry defendingFaction)
+    {
+        MapConfig cfg;
+        if (_mapConfigs.TryGetValue(mapName, out cfg))
+        {
+            _basesByFaction[attackingFaction] = new BaseZone(cfg.AttackingBase, cfg.Radius);
+            _basesByFaction[defendingFaction] = new BaseZone(cfg.DefendingBase, cfg.Radius);
+
+            CtFLogger.Log($"SetupBasesForMap: configured bases for '{mapName}' " + $"(attacker: {attackingFaction}, defender: {defendingFaction}, radius: {cfg.Radius}).");
+        }
+        else
+        {
+            // Still define something so we don't crash; behavior is just not meaningful.
+            _basesByFaction[attackingFaction] = new BaseZone(Vector3.zero, BaseRadius);
+            _basesByFaction[defendingFaction] = new BaseZone(Vector3.zero, BaseRadius);
+
+            CtFLogger.Warn($"SetupBasesForMap: no configuration for map '{mapName}'. " + $"Using default bases at origin with radius {BaseRadius}.");
+        }
+    }
+
+    private FactionCountry GetOpponentFaction(FactionCountry faction)
+    {
+        if (faction == FactionCountry.None) return FactionCountry.None;
+        if (_roundDetails == null) return FactionCountry.None;
+
+        if (faction == _roundDetails.AttackingFaction)
+            return _roundDetails.DefendingFaction;
+
+        if (faction == _roundDetails.DefendingFaction)
+            return _roundDetails.AttackingFaction;
+
+        return FactionCountry.None;
+    }
+
+    private static bool IsWithinBaseXZ(Vector3 pos, BaseZone zone)
+    {
+        var a = new Vector2(pos.x, pos.z);
+        var b = new Vector2(zone.Center.x, zone.Center.z);
+        return Vector2.Distance(a, b) < zone.Radius;
+    }
+
+    private void StartBaseCountdown(FlagState flag, int seconds)
+    {
+        flag.baseDeadlineTime = _elapsedSeconds + seconds;
+        flag.WarningSent = false;
+        flag.CountdownState = FlagCountdownState.CountdownActive;
+
+        Broadcast($"The {flag.FlagFaction} flag is in the enemy spawn! You have {seconds} seconds to get it out.");
+    }
+
+    private void CancelBaseCountdown(FlagState flag)
+    {
+        flag.baseDeadlineTime = 0;
+        flag.WarningSent = false;
+        flag.CountdownState = FlagCountdownState.None;
+    }
+
+    private void Broadcast(string message)
+    {
+        CommandExecutor.ExecuteCommand("broadcast " + message);
+    }
+
+    private void SetRoundWinner(FactionCountry winner)
+    {
+        if (winner == FactionCountry.None) return;
+        CtFLogger.Log($"SetRoundWinner: {winner} won the round");
+        CommandExecutor.ExecuteCommand(string.Format("set roundEndFactionWin {0} None", winner));
+    }
+
+    public bool getIsServer()
+    {
+        return _isServer;
     }
 
     public void PassConfigVariables(string[] value)
     {
-        for (int i = 0; i < value.Length; i++)
-        {
-            var splitData = value[i].Split(':');
-
-            if (splitData[0] == "ctf")
-            {
-                if (splitData[1] == "dropHeldWeapon")
-                {
-                    if (splitData[2] == "true")
-                    {
-
-                    }
-                    else
-                    {
-
-                    }
-                }
-                else if (splitData[1] == "class")
-                {
-                    if (splitData[2] == "ArmyInfantryOfficer")
-                    {
-
-                    }
-                    else if (splitData[2] == "ArmyLineInfantry")
-                }
-            }
-        }
+        // EnemyBaseHoldSeconds
+        // Base radius per map/faction
+        // Flag object names per faction/era/map
     }
 
-    public void OnPlayerKilledPlayer(int killerPlayerId, int victimPlayerId, EntityHealthChangedReason reason, string additionalDetails)
-    {
-
-    }
-
-    public void OnPlayerBlock(int attackingPlayerId, int defendingPlayerId)
-    {
-        
-    }
-
-    public void OnScorableAction(int playerId, int score, ScorableActionType reason)
-    {
-    
-    }
-
-    public void OnPlayerHurt(int playerId, byte oldHp, byte newHp, EntityHealthChangedReason reason)
-    {
-    
-    }
-
-    public void OnIsClient(bool client, ulong steamId)
-    {
-
-    }
-
-    public void OnUpdateTimeRemaining(float time)
-    {
-
-    }
-
-    public void OnPlayerWeaponSwitch(int playerId, string weapon)
-    {
-
-    }
-
-    public void OnTextMessage(int playerId, TextChatChannel channel, string text)
-    {
-
-    }
-
-    public void OnIsServer(bool server)
-    {
-        var canvases = Resources.FindObjectsOfTypeAll<Canvas>();
-        for (int i = 0; i < canvases.Length; i++)
-        {
-            //Find the one that's called "Game Console Panel"
-            if (string.Compare(canvases[i].name, "Game Console Panel", true) == 0)
-            {
-                //Inside this, now we need to find the input field where the player types messages.
-                f1MenuInputField = canvases[i].GetComponentInChildren<InputField>(true);
-                if (f1MenuInputField != null)
-                {
-                    Debug.Log("Found the Game Console Panel");
-                }
-                else
-                {
-                    Debug.Log("We did Not find Game Console Panel");
-                }
-                break;
-            }
-        }
-    }
-
-    public void OnConsoleCommand(string input, string output, bool success)
-    {
-
-    }
-
-    public void OnSyncValueState(int value)
-    {
-
-    }
-
-    public void OnUpdateSyncedTime(double time)
-    {
-
-    }
-
-    public void OnDamageableObjectDamaged(GameObject damageableObject, int damageableObjectId, int shipId, int oldHp, int newHp)
-    {
-
-    }
-
-    public void OnPlayerShoot(int playerId, bool dryShot)
-    {
-
-    }
-
-    public void OnPlayerMeleeStartSecondaryAttack(int playerId)
-    {
-
-    }
-
-    public void OnCapturePointCaptured(int capturePoint)
-    {
-
-    }
-
-    public void OnCapturePointOwnerChanged(int capturePoint, FactionCountry factionCountry)
-    {
-
-    }
-
-    public void OnCapturePointDataUpdated(int capturePoint, int defendingPlayerCount, int attackingPlayerCount)
-    {
-
-    }
-
-    public void OnRoundEndFactionWinner(FactionCountry factionCountry, FactionRoundWinnerReason reason)
-    {
-
-    }
-
-    public void OnRoundEndPlayerWinner(int playerId)
-    {
-
-    }
-
-    public void OnPlayerStartCarry(int playerId, CarryableObjectType carryableObject)
-    {
-
-    }
-
-    public void OnPlayerShout(int playerId, CharacterVoicePhrase voicePhrase)
-    {
-
-    }
-
-    public void OnEmplacementPlaced(int itemId, GameObject objectBuilt, EmplacementType emplacementType)
-    {
-
-    }
-
-    public void OnEmplacementConstructed(int itemId)
-    {
-
-    }
-
-    public void OnBuffStart(int playerId, BuffType buff)
-    {
-
-    }
-
-    public void OnBuffStop(int playerId, BuffType buff)
-    {
-
-    }
-
-    public void OnShotInfo(int playerId, int shotCount, Vector3[][] shotsPointsPositions, float[] trajectileDistances, float[] distanceFromFiringPositions, float[] horizontalDeviationAngles, float[] maxHorizontalDeviationAngles, float[] muzzleVelocities, float[] gravities, float[] damageHitBaseDamages, float[] damageRangeUnitValues, float[] damagePostTraitAndBuffValues, float[] totalDamages, Vector3[] hitPositions, Vector3[] hitDirections, int[] hitPlayerIds, int[] hitDamageableObjectIds, int[] hitShipIds, int[] hitVehicleIds)
-    {
-
-    }
-
-    public void OnVehicleSpawned(int vehicleId, FactionCountry vehicleFaction, PlayerClass vehicleClass, GameObject vehicleObject, int ownerPlayerId)
-    {
-
-    }
-
-    public void OnVehicleHurt(int vehicleId, byte oldHp, byte newHp, EntityHealthChangedReason reason)
-    {
-
-    }
-
-    public void OnPlayerKilledVehicle(int killerPlayerId, int victimVehicleId, EntityHealthChangedReason reason, string details)
-    {
-
-    }
-
-    public void OnShipSpawned(int shipId, GameObject shipObject, FactionCountry shipfaction, ShipType shipType, int shipNameId)
-    {
-
-    }
-
-    public void OnShipDamaged(int shipId, int oldHp, int newHp)
-    {
-
-    }
-
-    public void OnAdminPlayerAction(int playerId, int adminId, ServerAdminAction action, string reason)
-    {
-
-    }
-
-    public void OnRCLogin(int playerId, string inputPassword, bool isLoggedIn)
-    {
-
-    }
-
-    public void OnRCCommand(int playerId, string input, string output, bool success)
-    {
-
-    }
-
-    public void OnPlayerPacket(int playerId, byte? instance, Vector3? ownerPosition, double? packetTimestamp, Vector2? ownerInputAxis, float? ownerRotationY, float? ownerPitch, float? ownerYaw, PlayerActions[] actionCollection, Vector3? cameraPosition, Vector3? cameraForward, ushort? shipID, bool swimming)
-    {
-
-    }
-
-    public void OnVehiclePacket(int vehicleId, Vector2 inputAxis, bool shift, bool strafe, PlayerVehicleActions[] actionCollection)
-    {
-
-    }
-
-    public void OnOfficerOrderStart(int officerPlayerId, HighCommandOrderType highCommandOrderType, Vector3 orderPosition, float orderRotationY, int voicePhraseRandomIndex)
-    {
-
-    }
-
-    public void OnOfficerOrderStop(int officerPlayerId, HighCommandOrderType highCommandOrderType)
-    {
-
-    }
+    //Unused interface methods
+    public void OnPlayerKilledPlayer(int killerPlayerId, int victimPlayerId, EntityHealthChangedReason reason, string additionalDetails) { }
+    public void OnPlayerBlock(int attackingPlayerId, int defendingPlayerId) { }
+    public void OnScorableAction(int playerId, int score, ScorableActionType reason) { }
+    public void OnPlayerHurt(int playerId, byte oldHp, byte newHp, EntityHealthChangedReason reason) { }
+    public void OnIsClient(bool client, ulong steamId) { }
+    public void OnUpdateTimeRemaining(float time) { }
+    public void OnPlayerWeaponSwitch(int playerId, string weapon) { }
+    public void OnTextMessage(int playerId, TextChatChannel channel, string text) { }
+    public void OnConsoleCommand(string input, string output, bool success) { }
+    public void OnSyncValueState(int value) { }
+    public void OnUpdateSyncedTime(double time) { }
+    public void OnDamageableObjectDamaged(GameObject damageableObject, int damageableObjectId, int shipId, int oldHp, int newHp) { }
+    public void OnPlayerShoot(int playerId, bool dryShot) { }
+    public void OnPlayerMeleeStartSecondaryAttack(int playerId) { }
+    public void OnCapturePointCaptured(int capturePoint) { }
+    public void OnCapturePointOwnerChanged(int capturePoint, FactionCountry factionCountry) { }
+    public void OnCapturePointDataUpdated(int capturePoint, int defendingPlayerCount, int attackingPlayerCount) { }
+    public void OnRoundEndFactionWinner(FactionCountry factionCountry, FactionRoundWinnerReason reason) { }
+    public void OnRoundEndPlayerWinner(int playerId) { }
+    public void OnPlayerStartCarry(int playerId, CarryableObjectType carryableObject) { }
+    public void OnPlayerShout(int playerId, CharacterVoicePhrase voicePhrase) { }
+    public void OnEmplacementPlaced(int itemId, GameObject objectBuilt, EmplacementType emplacementType) { }
+    public void OnEmplacementConstructed(int itemId) { }
+    public void OnBuffStart(int playerId, BuffType buff) { }
+    public void OnBuffStop(int playerId, BuffType buff) { }
+    public void OnShotInfo(int playerId, int shotCount, Vector3[][] shotsPointsPositions, float[] trajectileDistances,
+        float[] distanceFromFiringPositions, float[] horizontalDeviationAngles, float[] maxHorizontalDeviationAngles,
+        float[] muzzleVelocities, float[] gravities, float[] damageHitBaseDamages, float[] damageRangeUnitValues,
+        float[] damagePostTraitAndBuffValues, float[] totalDamages, Vector3[] hitPositions, Vector3[] hitDirections,
+        int[] hitPlayerIds, int[] hitDamageableObjectIds, int[] hitShipIds, int[] hitVehicleIds)
+    { }
+    public void OnVehicleSpawned(int vehicleId, FactionCountry vehicleFaction, PlayerClass vehicleClass, GameObject vehicleObject, int ownerPlayerId) { }
+    public void OnVehicleHurt(int vehicleId, byte oldHp, byte newHp, EntityHealthChangedReason reason) { }
+    public void OnPlayerKilledVehicle(int killerPlayerId, int victimVehicleId, EntityHealthChangedReason reason, string details) { }
+    public void OnShipSpawned(int shipId, GameObject shipObject, FactionCountry shipfaction, ShipType shipType, int shipNameId) { }
+    public void OnShipDamaged(int shipId, int oldHp, int newHp) { }
+    public void OnAdminPlayerAction(int playerId, int adminId, ServerAdminAction action, string reason) { }
+    public void OnRCLogin(int playerId, string inputPassword, bool isLoggedIn) { }
+    public void OnRCCommand(int playerId, string input, string output, bool success) { }
+    public void OnPlayerPacket(int playerId, byte? instance, Vector3? ownerPosition, double? packetTimestamp, Vector2? ownerInputAxis,
+        float? ownerRotationY, float? ownerPitch, float? ownerYaw, PlayerActions[] actionCollection, Vector3? cameraPosition,
+        Vector3? cameraForward, ushort? shipID, bool swimming)
+    { }
+    public void OnVehiclePacket(int vehicleId, Vector2 inputAxis, bool shift, bool strafe, PlayerVehicleActions[] actionCollection) { }
+    public void OnOfficerOrderStart(int officerPlayerId, HighCommandOrderType highCommandOrderType, Vector3 orderPosition, float orderRotationY, int voicePhraseRandomIndex) { }
+    public void OnOfficerOrderStop(int officerPlayerId, HighCommandOrderType highCommandOrderType) { }
 }
