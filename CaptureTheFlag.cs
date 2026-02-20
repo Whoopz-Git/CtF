@@ -210,6 +210,8 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         // Name of the carryable object the player just picked up
         string carryName = carryableObject.ToString();
 
+        CtFLogger.Log($"Player {playerId} started carrying {carryName}");
+
         // Find which faction's flag this name corresponds to
         FactionCountry flagFaction = FactionCountry.None;
         foreach (var kvp in _flagObjectName)
@@ -259,8 +261,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             else
             {
                 // Friendly picked up own flag: log it
-                CtFLogger.Log(
-                    $"OnPlayerStartCarry: player {playerId} ({player.Name}, {player.Faction}) picked up their own {flag.FlagFaction} flag.");
+                CtFLogger.Log($"OnPlayerStartCarry: player {playerId} ({player.Name}, {player.Faction}) picked up their own {flag.FlagFaction} flag.");
             }
         }
         else
