@@ -24,7 +24,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
     private readonly Dictionary<FactionCountry, BaseZone> _basesByFaction = new Dictionary<FactionCountry, BaseZone>(8);
 
     // Mapping from faction flag object name in scene
-    private readonly Dictionary<FactionCountry, string> _flagObjectName =new Dictionary<FactionCountry, string>
+    private readonly Dictionary<FactionCountry, string> _flagObjectName = new Dictionary<FactionCountry, string>
     {
         {FactionCountry.British,  "Flag_British_Interactable"},
         {FactionCountry.French,   "Flag_French_Interactable"},
@@ -32,6 +32,21 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         {FactionCountry.Russian,  "Flag_Russian_Interactable"},
         {FactionCountry.Italian,  "Flag_Italian_Interactable"},
         {FactionCountry.Austrian, "Flag_Austrian_Interactable"},
+    };
+
+    // Workaround: Austrian flag carryable enum has no name; ToString() returns "54"
+    private const int AustrianFlagCarryableRaw = 54;
+
+    // Mapping from carryable flag enum to its faction
+    private readonly Dictionary<CarryableObjectType, FactionCountry> _flagFactionByCarryable = new Dictionary<CarryableObjectType, FactionCountry>
+    {
+        { CarryableObjectType.FlagBritish,  FactionCountry.British },
+        { CarryableObjectType.FlagFrench,   FactionCountry.French },
+        { CarryableObjectType.FlagPrussian, FactionCountry.Prussian },
+        { CarryableObjectType.FlagRussian,  FactionCountry.Russian },
+        { CarryableObjectType.FlagItalian,  FactionCountry.Italian },
+        // Austrian flag has no named enum; use its raw value (ToString() == "54")
+        { (CarryableObjectType)AustrianFlagCarryableRaw, FactionCountry.Austrian },
     };
 
     // Hard Coded Map configs
@@ -207,29 +222,15 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
     public void OnPlayerStartCarry(int playerId, CarryableObjectType carryableObject)
     {
-        // Name of the carryable object the player just picked up
-        string carryName = carryableObject.ToString();
-
-        CtFLogger.Log($"Player {playerId} started carrying {carryName}");
-
-        // Find which faction's flag this name corresponds to
-        FactionCountry flagFaction = FactionCountry.None;
-        foreach (var kvp in _flagObjectName)
+        // Only handle flag carryables we know about
+        if (!_flagFactionByCarryable.TryGetValue(carryableObject, out var flagFaction))
         {
-            if (string.Equals(kvp.Value, carryName, StringComparison.Ordinal))
-            {
-                flagFaction = kvp.Key;
-                break;
-            }
-        }
-
-        // Not one of our configured flags
-        if (flagFaction == FactionCountry.None)
-        {
+            // Not a flag we care about (ammo, tools, etc.)
+            CtFLogger.Log($"OnPlayerStartCarry: ignoring non-flag carryable '{carryableObject}'.");
             return;
         }
 
-        // Find the corresponding FlagState
+        // Find the corresponding FlagState for this faction
         FlagState flag = null;
         foreach (var f in _flags)
         {
@@ -242,7 +243,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
         if (flag == null)
         {
-            CtFLogger.Warn($"OnPlayerStartCarry: no FlagState found for faction {flagFaction} (carryable '{carryName}').");
+            CtFLogger.Warn($"OnPlayerStartCarry: no FlagState found for faction {flagFaction}.");
             return;
         }
 
@@ -250,30 +251,26 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         flag.CarrierPlayerId = playerId;
 
         // Look up player for logging / capture decisions
-        if (_players.TryGetValue(playerId, out var player) &&
-            player.Faction != FactionCountry.None)
+        if (_players.TryGetValue(playerId, out var player) && player.Faction != FactionCountry.None)
         {
-            if (player.Faction != flag.FlagFaction)
+            if (player.Faction == flag.FlagFaction)
             {
-                // Enemy picked up: announce capture
-                Broadcast($"The {flag.FlagFaction} flag has been captured by the enemy!");
+                // Friendly picking up their own flag
+                CtFLogger.Log($"OnPlayerStartCarry: player {playerId} ({player.Name}, {player.Faction}) picked up their own {flag.FlagFaction} flag.");
             }
             else
             {
-                // Friendly picked up own flag: log it
-                CtFLogger.Log($"OnPlayerStartCarry: player {playerId} ({player.Name}, {player.Faction}) picked up their own {flag.FlagFaction} flag.");
+                // Enemy picking up the flag: broadcast full capture message
+                Broadcast($"The {flag.FlagFaction} flag has been captured by {player.Faction} player {player.Name}!");
+                CtFLogger.Log($"OnPlayerStartCarry: enemy player {playerId} ({player.Name}, {player.Faction}) picked up {flag.FlagFaction} flag.");
             }
         }
         else
         {
-            // No faction info
-            CtFLogger.Log($"OnPlayerStartCarry: player {playerId} picked up {flag.FlagFaction} flag (carryable '{carryName}') but faction is unknown.");
+            CtFLogger.Warn($"OnPlayerStartCarry: player {playerId} picked up {flag.FlagFaction} flag but faction is unknown.");
         }
 
-        // Picking it up cancels any existing base countdown; zone logic will restart if needed
-        CancelBaseCountdown(flag);
-
-        CtFLogger.Log($"OnPlayerStartCarry: player {playerId} now carrying {flag.FlagFaction} flag (carryable '{carryName}').");
+        CtFLogger.Log($"OnPlayerStartCarry: player {playerId} now carrying {flag.FlagFaction} flag.");
     }
 
     public void OnPlayerEndCarry(int playerId)
@@ -306,15 +303,31 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             var flagPos = GetFlagPosition(flag);
             bool inEnemyBase = IsWithinBase(flagPos, enemyBase);
 
-            // Entering enemy base: start countdown if not already running
-            if (inEnemyBase && flag.CountdownState == FlagCountdownState.None)
+            // Is it being carried by its own faction?
+            bool carriedByOwner = false;
+            if (flag.CarrierPlayerId != 0 &&
+                _players.TryGetValue(flag.CarrierPlayerId, out var carrier) &&
+                carrier.Faction != FactionCountry.None &&
+                carrier.Faction == flag.FlagFaction)
+            {
+                carriedByOwner = true;
+            }
+
+            // For countdown purposes, treat the flag as "threatening" only if:
+            // It's in the enemy base
+            // It's NOT currently carried by its own faction
+            bool shouldCountAsInEnemyBase = inEnemyBase && !carriedByOwner;
+
+            // Entering enemy base (under enemy control): start countdown if not already running
+            if (shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.None)
             {
                 StartBaseCountdown(flag, BaseHoldSeconds);
             }
-            // Leaving enemy base: cancel any running countdown and announce it
-            else if (!inEnemyBase && flag.CountdownState == FlagCountdownState.CountdownActive)
+
+            // Either left enemy base OR is now carried by its owner in the base: cancel countdown
+            else if (!shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.CountdownActive)
             {
-                Broadcast($"The {flag.FlagFaction} flag has been removed from the enemy spawn! Capture cancelled.");
+                Broadcast($"The {flag.FlagFaction} flag is no longer in enemy control within their spawn. Capture cancelled.");
                 CancelBaseCountdown(flag);
                 continue; // no further countdown processing this tick
             }
@@ -328,8 +341,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             // Warning before round end
             if (!flag.WarningSent && remaining == WarningSeconds)
             {
-                Broadcast(
-                    $"The {flag.FlagFaction} flag is in the enemy spawn! You have {WarningSeconds} seconds to get it out.");
+                Broadcast($"The {flag.FlagFaction} flag is in the enemy spawn under enemy control! Only {WarningSeconds} seconds to recapture it!");
                 flag.WarningSent = true;
             }
 
@@ -338,7 +350,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             {
                 CtFLogger.Log("Flag base countdown reached deadline; ending round.");
 
-                // enemyFaction is already the opponent
                 if (enemyFaction != FactionCountry.None)
                 {
                     SetRoundWinner(enemyFaction);
@@ -484,9 +495,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
     {
         // If we know who is carrying it and that player's object exists,
         // treat the player's position as the flag position.
-        if (flag.CarrierPlayerId != 0 &&
-            _players.TryGetValue(flag.CarrierPlayerId, out var carrier) &&
-            carrier.PlayerObject != null)
+        if (flag.CarrierPlayerId != 0 && _players.TryGetValue(flag.CarrierPlayerId, out var carrier) && carrier.PlayerObject != null)
         {
             return carrier.PlayerObject.transform.position;
         }
