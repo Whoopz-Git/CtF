@@ -49,19 +49,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         { (CarryableObjectType)AustrianFlagCarryableRaw, FactionCountry.Austrian },
     };
 
-    // Hard Coded Map configs
-    private readonly Dictionary<string, MapConfig> _mapConfigs = new Dictionary<string, MapConfig>(StringComparer.OrdinalIgnoreCase)
-    {
-         {
-             "ChampsdAmbre",
-             new MapConfig(
-                 attackingBase: new Vector3(4.0f, 13.71f, -195.0f),
-                 defendingBase: new Vector3(-0.5f, 13.71f, 230.0f),
-                 radius: 30f
-             )
-         }
-    };
-
     // Data Types
     private class PlayerState
     {
@@ -117,20 +104,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         public BaseZone(Vector3 center, float radius)
         {
             Center = center;
-            Radius = radius;
-        }
-    }
-
-    private readonly struct MapConfig
-    {
-        public readonly Vector3 AttackingBase;
-        public readonly Vector3 DefendingBase;
-        public readonly float Radius;
-
-        public MapConfig(Vector3 attackingBase, Vector3 defendingBase, float radius)
-        {
-            AttackingBase = attackingBase;
-            DefendingBase = defendingBase;
             Radius = radius;
         }
     }
@@ -420,7 +393,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
     private void SetupBasesForMap(string mapName, FactionCountry attackingFaction, FactionCountry defendingFaction)
     {
         MapConfig cfg;
-        if (_mapConfigs.TryGetValue(mapName, out cfg))
+        if (CtFMapPresets.TryGetMapConfig(mapName, out cfg))
         {
             _basesByFaction[attackingFaction] = new BaseZone(cfg.AttackingBase, cfg.Radius);
             _basesByFaction[defendingFaction] = new BaseZone(cfg.DefendingBase, cfg.Radius);
