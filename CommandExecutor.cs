@@ -41,14 +41,14 @@ namespace CtF
         // Execute a command in the game console
         public static void ExecuteCommand(string command)
         {
-            if (consoleInputField == null)
-            {
-                CtFLogger.Error("Cannot execute command - Console Input Field is null.");
-                return;
-            }
             if (!_isServer)
             {
                 CtFLogger.Log($"Server side command fired: {command}");
+                return;
+            }
+            if (consoleInputField == null)
+            {
+                CtFLogger.Error("Cannot execute command - Console Input Field is null.");
                 return;
             }
             consoleInputField.onEndEdit.Invoke(command);
