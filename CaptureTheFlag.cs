@@ -248,18 +248,34 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         // Mark who is carrying this flag
         flag.CarrierPlayerId = playerId;
 
-        // If an enemy picked it up, announce the capture
+        // Look up player for logging / capture decisions
         if (_players.TryGetValue(playerId, out var player) &&
-            player.Faction != FactionCountry.None &&
-            player.Faction != flag.FlagFaction)
+            player.Faction != FactionCountry.None)
         {
-            Broadcast($"The {flag.FlagFaction} flag has been captured!");
+            if (player.Faction != flag.FlagFaction)
+            {
+                // Enemy picked up: announce capture
+                Broadcast($"The {flag.FlagFaction} flag has been captured by the enemy!");
+            }
+            else
+            {
+                // Friendly picked up own flag: log it
+                CtFLogger.Log(
+                    $"OnPlayerStartCarry: player {playerId} ({player.Name}, {player.Faction}) picked up their own {flag.FlagFaction} flag.");
+            }
+        }
+        else
+        {
+            // No faction info – still log
+            CtFLogger.Log(
+                $"OnPlayerStartCarry: player {playerId} picked up {flag.FlagFaction} flag (carryable '{carryName}') but faction is unknown.");
         }
 
         // Picking it up cancels any existing base countdown; zone logic will restart if needed
         CancelBaseCountdown(flag);
 
-        CtFLogger.Log($"OnPlayerStartCarry: player {playerId} now carrying {flag.FlagFaction} flag (carryable '{carryName}').");
+        CtFLogger.Log(
+            $"OnPlayerStartCarry: player {playerId} now carrying {flag.FlagFaction} flag (carryable '{carryName}').");
     }
 
     public void OnPlayerEndCarry(int playerId)
@@ -277,6 +293,13 @@ public class CaptureTheFlag : IHoldfastSharedMethods
     public void OnUpdateElapsedTime(float time)
     {
         _elapsedSeconds = (int)time;
+
+        // Debug: log flag status every 5 seconds
+        if (_elapsedSeconds - _lastFlagStatusLogSecond >= 5)
+        {
+            _lastFlagStatusLogSecond = _elapsedSeconds;
+            LogFlagStatusSnapshot();
+        }
 
         foreach (var flag in _flags)
         {
@@ -480,6 +503,45 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
         // Otherwise, fall back to the flag object's position.
         return flag.FlagObject.transform.position;
+    }
+
+    // Temp flag locations logging.
+    private int _lastFlagStatusLogSecond = -5;
+    private void LogFlagStatusSnapshot()
+    {
+        if (_flags.Count == 0)
+        {
+            CtFLogger.Log("FlagStatus: no flags registered for this round.");
+            return;
+        }
+
+        foreach (var flag in _flags)
+        {
+            // Carrier info
+            string carrierInfo = "no carrier";
+            if (flag.CarrierPlayerId != 0 && _players.TryGetValue(flag.CarrierPlayerId, out var carrier))
+            {
+                carrierInfo = $"carrier={flag.CarrierPlayerId} ({carrier.Name}, {carrier.Faction})";
+            }
+
+            // Countdown info
+            string countdownInfo;
+            if (flag.CountdownState == FlagCountdownState.CountdownActive)
+            {
+                int remaining = flag.baseDeadlineTime - _elapsedSeconds;
+                countdownInfo = $"countdown=ACTIVE, deadline={flag.baseDeadlineTime}, remaining={remaining}";
+            }
+            else
+            {
+                countdownInfo = $"countdown={flag.CountdownState}";
+            }
+
+            // Position info (carrier or flag object)
+            var pos = GetFlagPosition(flag);
+
+            CtFLogger.Log(
+                $"FlagStatus: faction={flag.FlagFaction}, pos=({pos.x:F1},{pos.y:F1},{pos.z:F1}), {carrierInfo}, {countdownInfo}");
+        }
     }
 
     //Unused interface methods
