@@ -1,18 +1,28 @@
+using CtF;
+using HoldfastSharedMethods;
 using System;
 using System.Collections.Generic;
-using HoldfastSharedMethods;
+using System.Globalization;
 using UnityEngine;
-using CtF;
 
 public class CaptureTheFlag : IHoldfastSharedMethods
 {
-    // Make Config Driven Later
-    private const int BaseHoldSeconds = 60;
+
+    private int CaptureTimeInSeconds = 60;
     private const int WarningSeconds = 30;
-    private const float BaseRadius = 30f;
+    private const float DefaultBaseRadius = 30f;
+
+    // If set via config, overrides preset/default base radius for all maps
+    private float? _baseRadiusOverride = null;
 
     private bool _isServer;
     private int _elapsedSeconds;
+
+    private bool _attackingBasePosOverrideSet;
+    private Vector3 _attackingBasePosOverride;
+
+    private bool _defendingSpawnPosOverrideSet;
+    private Vector3 _defendingSpawnPosOverride;
 
     private RoundInfo _roundDetails;
     private readonly Dictionary<int, PlayerState> _players = new Dictionary<int, PlayerState>();
@@ -34,7 +44,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         {FactionCountry.Austrian, "Flag_Austrian_Interactable"},
     };
 
-    // Workaround: Austrian flag carryable enum has no name; ToString() returns "54"
+    // Workaround: Austrian flag carryable enum has no name. ToString() returns "54"
     private const int AustrianFlagCarryableRaw = 54;
 
     // Mapping from carryable flag enum to its faction
@@ -47,19 +57,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         { CarryableObjectType.FlagItalian,  FactionCountry.Italian },
         // Austrian flag has no named enum; use its raw value (ToString() == "54")
         { (CarryableObjectType)AustrianFlagCarryableRaw, FactionCountry.Austrian },
-    };
-
-    // Hard Coded Map configs
-    private readonly Dictionary<string, MapConfig> _mapConfigs = new Dictionary<string, MapConfig>(StringComparer.OrdinalIgnoreCase)
-    {
-         {
-             "ChampsdAmbre",
-             new MapConfig(
-                 attackingBase: new Vector3(4.0f, 13.71f, -195.0f),
-                 defendingBase: new Vector3(-0.5f, 13.71f, 230.0f),
-                 radius: 30f
-             )
-         }
     };
 
     // Data Types
@@ -117,20 +114,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         public BaseZone(Vector3 center, float radius)
         {
             Center = center;
-            Radius = radius;
-        }
-    }
-
-    private readonly struct MapConfig
-    {
-        public readonly Vector3 AttackingBase;
-        public readonly Vector3 DefendingBase;
-        public readonly float Radius;
-
-        public MapConfig(Vector3 attackingBase, Vector3 defendingBase, float radius)
-        {
-            AttackingBase = attackingBase;
-            DefendingBase = defendingBase;
             Radius = radius;
         }
     }
@@ -225,8 +208,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         // Only handle flag carryables we know about
         if (!_flagFactionByCarryable.TryGetValue(carryableObject, out var flagFaction))
         {
-            // Not a flag we care about (ammo, tools, etc.)
-            CtFLogger.Log($"OnPlayerStartCarry: ignoring non-flag carryable '{carryableObject}'.");
             return;
         }
 
@@ -243,7 +224,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
         if (flag == null)
         {
-            CtFLogger.Warn($"OnPlayerStartCarry: no FlagState found for faction {flagFaction}.");
+            CtFLogger.Error($"No FlagState found for faction {flagFaction}.");
             return;
         }
 
@@ -256,21 +237,21 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             if (player.Faction == flag.FlagFaction)
             {
                 // Friendly picking up their own flag
-                CtFLogger.Log($"OnPlayerStartCarry: player {playerId} ({player.Name}, {player.Faction}) picked up their own {flag.FlagFaction} flag.");
+                CtFLogger.Log($"{player.Name} picked up their own {flag.FlagFaction} flag.");
             }
             else
             {
                 // Enemy picking up the flag: broadcast full capture message
-                Broadcast($"The {flag.FlagFaction} flag has been captured by {player.Faction} player {player.Name}!");
-                CtFLogger.Log($"OnPlayerStartCarry: enemy player {playerId} ({player.Name}, {player.Faction}) picked up {flag.FlagFaction} flag.");
+                Broadcast($"The {flag.FlagFaction} flag has been captured by player {player.Name}!");
+                CtFLogger.Log($"{player.Name} captured the {flag.FlagFaction} flag.");
             }
         }
         else
         {
-            CtFLogger.Warn($"OnPlayerStartCarry: player {playerId} picked up {flag.FlagFaction} flag but faction is unknown.");
+            CtFLogger.Warn($"{player.Name} picked up {flag.FlagFaction} flag but faction is unknown.");
         }
 
-        CtFLogger.Log($"OnPlayerStartCarry: player {playerId} now carrying {flag.FlagFaction} flag.");
+        CtFLogger.Log($"{player.Name} is now carrying {flag.FlagFaction} flag.");
     }
 
     public void OnPlayerEndCarry(int playerId)
@@ -279,8 +260,9 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         {
             if (flag.CarrierPlayerId == playerId)
             {
+                string playerName = _players.TryGetValue(playerId, out var playerState) ? playerState.Name : null;
                 flag.CarrierPlayerId = 0;
-                CtFLogger.Log($"OnPlayerEndCarry: player {playerId} no longer carrying {flag.FlagFaction} flag.");
+                CtFLogger.Log($"{playerState} is no longer carrying the {flag.FlagFaction} flag.");
             }
         }
     }
@@ -321,7 +303,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
             // Entering enemy base (under enemy control): start countdown if not already running
             if (shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.None)
             {
-                StartBaseCountdown(flag, BaseHoldSeconds);
+                StartBaseCountdown(flag, CaptureTimeInSeconds);
             }
 
             // Either left enemy base OR is now carried by its owner in the base: cancel countdown
@@ -356,7 +338,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
                 }
                 else
                 {
-                    CtFLogger.Warn($"OnUpdateElapsedTime: could not determine opponent faction for {flag.FlagFaction}");
+                    CtFLogger.Warn($"Could not determine opponent faction for {flag.FlagFaction}");
                 }
 
                 flag.CountdownState = FlagCountdownState.RoundEnded;
@@ -366,9 +348,84 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
     public void PassConfigVariables(string[] value)
     {
-        // EnemyBaseHoldSeconds
-        // Base radius per map/faction
-        // Flag object names per faction/era/map
+        if (value == null) return;
+
+        foreach (var raw in value)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            var split = raw.Split(':');
+            if (split.Length < 3)
+                continue;
+
+            var modId = split[0];
+            if (!modId.Equals("CTF", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var key = split[1];
+            var arg = split[2];
+
+            switch (key.ToLowerInvariant())
+            {
+                case "capturetime":
+                    {
+                        if (int.TryParse(arg, out var seconds) && seconds > 0)
+                        {
+                            CaptureTimeInSeconds = seconds;
+                            CtFLogger.Log($"CaptureTime set to {CaptureTimeInSeconds} seconds.");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid CaptureTime value '{arg}'. Must be a positive integer. Value set to deafult.");
+                        }
+                        break;
+                    }
+                case "baseradius":
+                    {
+                        if (float.TryParse(arg, out var radius) && radius > 0f)
+                        {
+                            _baseRadiusOverride = radius;
+                            CtFLogger.Log($"BaseRadius set to {_baseRadiusOverride.Value}.");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid BaseRadius value '{arg}'. Must be a positive number.");
+                        }
+                        break;
+                    }
+
+                case "attackingbaseposition":
+                    {
+                        if (TryParseVector3(arg, out var pos))
+                        {
+                            _attackingBasePosOverrideSet = true;
+                            _attackingBasePosOverride = pos;
+                            CtFLogger.Warn($"AttackingBasePosition override set to {pos}");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid AttackingBasePosition '{arg}'. Expected floats in format x,y,z");
+                        }
+                        break;
+                    }
+
+                case "defendingspawnposition":
+                    {
+                        if (TryParseVector3(arg, out var pos))
+                        {
+                            _defendingSpawnPosOverrideSet = true;
+                            _defendingSpawnPosOverride = pos;
+                            CtFLogger.Warn($"DefendingSpawnPosition override set to {pos}");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid DefendingSpawnPosition '{arg}'. Expected floats in format x,y,z");
+                        }
+                        break;
+                    }
+            }
+        }
     }
 
     //Helpers
@@ -390,7 +447,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         string objectName;
         if (!_flagObjectName.TryGetValue(faction, out objectName) || string.IsNullOrEmpty(objectName))
         {
-            CtFLogger.Warn($"TryRegisterFlag: no flag object mapping for faction {faction}.");
+            CtFLogger.Warn($"No flag object mapping for faction {faction}.");
             return;
         }
 
@@ -398,7 +455,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         if (flagObj == null)
         {
             var mapName = _roundDetails != null ? _roundDetails.MapName : "unknown";
-            CtFLogger.Warn( $"TryRegisterFlag: could not find flag object '{objectName}' for faction {faction} on map '{mapName}'.");
+            CtFLogger.Warn( $"Could not find flag object '{objectName}' for faction {faction} on map '{mapName}'.");
             return;
         }
 
@@ -414,26 +471,52 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
         _flags.Add(flag);
 
-        CtFLogger.Log($"TryRegisterFlag: registered flag for faction {faction} (object '{objectName}').");
+        CtFLogger.Log($"Registered flag for faction {faction} (object '{objectName}').");
     }
 
     private void SetupBasesForMap(string mapName, FactionCountry attackingFaction, FactionCountry defendingFaction)
     {
-        MapConfig cfg;
-        if (_mapConfigs.TryGetValue(mapName, out cfg))
-        {
-            _basesByFaction[attackingFaction] = new BaseZone(cfg.AttackingBase, cfg.Radius);
-            _basesByFaction[defendingFaction] = new BaseZone(cfg.DefendingBase, cfg.Radius);
+        CtF.MapConfig cfg;
+        bool hasPreset = CtFMapPresets.TryGetMapConfig(mapName, out cfg);
 
-            CtFLogger.Log($"SetupBasesForMap: configured bases for '{mapName}' " + $"(attacker: {attackingFaction}, defender: {defendingFaction}, radius: {cfg.Radius}).");
+        float radius = _baseRadiusOverride ?? (hasPreset ? cfg.Radius : DefaultBaseRadius);
+
+        Vector3 attackingPos;
+        Vector3 defendingPos;
+
+        if (_attackingBasePosOverrideSet || _defendingSpawnPosOverrideSet)
+        {
+            attackingPos = _attackingBasePosOverrideSet
+                ? _attackingBasePosOverride
+                : (hasPreset ? cfg.AttackingBase : Vector3.zero);
+
+            defendingPos = _defendingSpawnPosOverrideSet
+                ? _defendingSpawnPosOverride
+                : (hasPreset ? cfg.DefendingBase : Vector3.zero);
+        }
+        else if (hasPreset)
+        {
+            attackingPos = cfg.AttackingBase;
+            defendingPos = cfg.DefendingBase;
         }
         else
         {
-            // Still define something so we don't crash; behavior is just not meaningful.
-            _basesByFaction[attackingFaction] = new BaseZone(Vector3.zero, BaseRadius);
-            _basesByFaction[defendingFaction] = new BaseZone(Vector3.zero, BaseRadius);
+            attackingPos = Vector3.zero;
+            defendingPos = Vector3.zero;
+        }
 
-            CtFLogger.Warn($"SetupBasesForMap: no configuration for map '{mapName}'. " + $"Using default bases at origin with radius {BaseRadius}.");
+        _basesByFaction[attackingFaction] = new BaseZone(attackingPos, radius);
+        _basesByFaction[defendingFaction] = new BaseZone(defendingPos, radius);
+
+        var reason = _baseRadiusOverride.HasValue ? "config override" : (hasPreset ? "preset" : "default");
+
+        if (hasPreset)
+        {
+            CtFLogger.Log($"Configured bases for '{mapName}' (attacker: {attackingFaction}, defender: {defendingFaction}, radius: {radius} via {reason}).");
+        }
+        else
+        {
+            CtFLogger.Warn($"No configuration for map '{mapName}'. Using bases at origin with radius {radius} ({reason}).");
         }
     }
 
@@ -502,6 +585,28 @@ public class CaptureTheFlag : IHoldfastSharedMethods
 
         // Otherwise, fall back to the flag object's position.
         return flag.FlagObject.transform.position;
+    }
+
+    private static bool TryParseVector3(string s, out Vector3 v)
+    {
+        v = default;
+
+        if (string.IsNullOrWhiteSpace(s))
+            return false;
+
+        var parts = s.Split(',');
+        if (parts.Length != 3)
+            return false;
+
+        var style = NumberStyles.Float | NumberStyles.AllowThousands;
+        var ci = CultureInfo.InvariantCulture;
+
+        if (!float.TryParse(parts[0].Trim(), style, ci, out var x)) return false;
+        if (!float.TryParse(parts[1].Trim(), style, ci, out var y)) return false;
+        if (!float.TryParse(parts[2].Trim(), style, ci, out var z)) return false;
+
+        v = new Vector3(x, y, z);
+        return true;
     }
 
     //Unused interface methods
