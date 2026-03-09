@@ -1,11 +1,12 @@
 using CtF;
+using HoldfastBridge;
 using HoldfastSharedMethods;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using UnityEngine;
 
-public class CaptureTheFlag : IHoldfastSharedMethods
+public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 {
 
     private int CaptureTimeInSeconds = 60;
@@ -118,18 +119,17 @@ public class CaptureTheFlag : IHoldfastSharedMethods
         }
     }
 
+    public void OnGameMethodsInitialized(IHoldfastGameMethods holdfastGameMethods)
+    {
+        Debug.Log("[CtF] Trying to find game console...");
+        CommandExecutor.Initialize(holdfastGameMethods);
+    }
+
     public void OnIsServer(bool server)
     {
         _isServer = server;
-        // Currently Hard Coded. Config driven later.
         CtFLogger.SetEnabled(true);
-        CommandExecutor.SetServerState(server);
-
-        if (!server)
-        {
-            return;
-        }
-        CommandExecutor.InitializeConsole();
+        CommandExecutor.IsServer = _isServer;
     }
 
     public void OnPlayerJoined(int playerId, ulong steamId, string name, string regimentTag, bool isBot)
