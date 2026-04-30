@@ -13,6 +13,10 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     private const int WarningSeconds = 30;
     private const float DefaultBaseRadius = 30f;
 
+    private int _respawnWaveTimerSeconds = 30;
+    private int _lastRespawnWaveTime = 0;
+    private readonly List<FactionCountry> _revivedFactions = new List<FactionCountry>();
+
     // If set via config, overrides preset/default base radius for all maps
     private float? _baseRadiusOverride = null;
 
@@ -69,6 +73,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         public string Name;
         public string RegimentTag;
         public bool IsBot;
+        public bool IsAlive;
 
         // From OnPlayerSpawned
         public GameObject PlayerObject;
@@ -163,7 +168,8 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 SteamId = 0UL,
                 Name = string.Empty,
                 RegimentTag = string.Empty,
-                IsBot = false
+                IsBot = false,
+                IsAlive = true
             };
             _players[playerId] = player;
         }
@@ -173,6 +179,14 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         player.Faction = playerFaction;
         player.PlayerClass = playerClass;
         player.UniformId = uniformId;
+        player.IsAlive = true;
+    }
+    public void OnPlayerKilledPlayer(int killerPlayerId, int victimPlayerId, EntityHealthChangedReason reason, string additionalDetails)
+    {
+        if (_players.TryGetValue(victimPlayerId, out var victim))
+        {
+            victim.IsAlive = false;
+        }
     }
 
     public void OnPlayerLeft(int playerId)
@@ -262,7 +276,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             {
                 string playerName = _players.TryGetValue(playerId, out var playerState) ? playerState.Name : null;
                 flag.CarrierPlayerId = 0;
-                CtFLogger.Log($"{playerState} is no longer carrying the {flag.FlagFaction} flag.");
+                CtFLogger.Log($"{playerName} is no longer carrying the {flag.FlagFaction} flag.");
             }
         }
     }
@@ -305,7 +319,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             {
                 StartBaseCountdown(flag, CaptureTimeInSeconds);
             }
-
             // Either left enemy base OR is now carried by its owner in the base: cancel countdown
             else if (!shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.CountdownActive)
             {
@@ -343,6 +356,12 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
                 flag.CountdownState = FlagCountdownState.RoundEnded;
             }
+        }
+
+        if (_elapsedSeconds - _lastRespawnWaveTime >= _respawnWaveTimerSeconds)
+        {
+            _lastRespawnWaveTime = _elapsedSeconds;
+            WaveRespawn();
         }
     }
 
@@ -424,6 +443,20 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                         }
                         break;
                     }
+
+                case "respawntimer":
+                    {
+                        if (int.TryParse(arg, out var seconds) && seconds > 0)
+                        {
+                            _respawnWaveTimerSeconds = seconds;
+                            CtFLogger.Log($"RespawnTimer set to {_respawnWaveTimerSeconds} seconds.");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid RespawnTimer value '{arg}'. Must be a positive integer.");
+                        }
+                        break;
+                    }
             }
         }
     }
@@ -432,6 +465,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     private void ResetRoundState()
     {
         _elapsedSeconds = 0;
+        _lastRespawnWaveTime = 0;
 
         _flags.Clear();
         _basesByFaction.Clear();
@@ -569,7 +603,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         CommandExecutor.ExecuteCommand(string.Format("set roundEndFactionWin {0} None", winner));
     }
 
-    public bool getIsServer()
+    public bool GetIsServer()
     {
         return _isServer;
     }
@@ -609,9 +643,39 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         return true;
     }
 
+    private void WaveRespawn()
+    {
+        _revivedFactions.Clear();
+
+        foreach (var flag in _flags)
+        {
+            if (flag.CarrierPlayerId == 0) continue;
+            if (!_players.TryGetValue(flag.CarrierPlayerId, out var carrier)) continue;
+            if (carrier.Faction != flag.FlagFaction) continue;
+
+            int revivedCount = 0;
+            foreach (var kvp in _players)
+            {
+                var player = kvp.Value;
+                if (player.Faction != flag.FlagFaction) continue;
+                if (player.IsAlive) continue;
+
+                CommandExecutor.ExecuteCommand($"serverAdmin revive {player.PlayerId}");
+                revivedCount++;
+            }
+
+            if (revivedCount > 0)
+                _revivedFactions.Add(flag.FlagFaction);
+        }
+
+        if (_revivedFactions.Count == 2)
+            Broadcast("Both sides have respawned!");
+        else if (_revivedFactions.Count == 1)
+            Broadcast($"The {_revivedFactions[0]} faction has respawned!");
+    }
+
     //Unused interface methods
     public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject, InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex) { }
-    public void OnPlayerKilledPlayer(int killerPlayerId, int victimPlayerId, EntityHealthChangedReason reason, string additionalDetails) { }
     public void OnPlayerBlock(int attackingPlayerId, int defendingPlayerId) { }
     public void OnScorableAction(int playerId, int score, ScorableActionType reason) { }
     public void OnPlayerHurt(int playerId, byte oldHp, byte newHp, EntityHealthChangedReason reason) { }
