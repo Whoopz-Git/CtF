@@ -653,7 +653,9 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             if (!_players.TryGetValue(flag.CarrierPlayerId, out var carrier)) continue;
             if (carrier.Faction != flag.FlagFaction) continue;
 
+            var flagPos = GetFlagPosition(flag);
             int revivedCount = 0;
+
             foreach (var kvp in _players)
             {
                 var player = kvp.Value;
@@ -661,6 +663,12 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 if (player.IsAlive) continue;
 
                 CommandExecutor.ExecuteCommand($"serverAdmin revive {player.PlayerId}");
+
+                var spawnPos = GetRandomSpawnAroundFlag(flagPos);
+                CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
+                    "teleport {0} {1},{2},{3}",
+                    player.PlayerId, spawnPos.x, spawnPos.y, spawnPos.z));
+
                 revivedCount++;
             }
 
@@ -672,6 +680,18 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             Broadcast("Both sides have respawned!");
         else if (_revivedFactions.Count == 1)
             Broadcast($"The {_revivedFactions[0]} faction has respawned!");
+    }
+
+    private static Vector3 GetRandomSpawnAroundFlag(Vector3 flagPos)
+    {
+        float angle = UnityEngine.Random.Range(0f, 360f) * Mathf.Deg2Rad;
+        float radius = UnityEngine.Random.Range(1f, 5f);
+
+        float x = flagPos.x + radius * Mathf.Cos(angle);
+        float z = flagPos.z + radius * Mathf.Sin(angle);
+        float y = TerrainSampler.SampleTerrain(new Vector2(x, z));
+
+        return new Vector3(x, y, z);
     }
 
     //Unused interface methods
