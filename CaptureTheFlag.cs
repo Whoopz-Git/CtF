@@ -8,7 +8,6 @@ using UnityEngine;
 
 public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 {
-
     private int CaptureTimeInSeconds = 60;
     private const int WarningSeconds = 30;
     private const float DefaultBaseRadius = 30f;
@@ -16,6 +15,12 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     private int _respawnWaveTimerSeconds = 30;
     private int _lastRespawnWaveTime = 0;
     private readonly List<FactionCountry> _revivedFactions = new List<FactionCountry>();
+
+    private int _flagLocationIntervalSeconds = 30;
+    private int _lastFlagLocationBroadcastTime = 0;
+
+    private int _respawnTickets = 100;
+    private readonly Dictionary<FactionCountry, int> _factionTickets = new Dictionary<FactionCountry, int>();
 
     // If set via config, overrides preset/default base radius for all maps
     private float? _baseRadiusOverride = null;
@@ -124,6 +129,16 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         }
     }
 
+    private readonly List<PendingTeleport> _pendingTeleports = new List<PendingTeleport>();
+    private float _elapsedTime; // raw float, kept alongside _elapsedSeconds
+
+    private struct PendingTeleport
+    {
+        public int PlayerId;
+        public Vector3 Position;
+        public float FireAtTime;
+    }
+
     public void OnGameMethodsInitialized(IHoldfastGameMethods holdfastGameMethods)
     {
         Debug.Log("[CtF] Trying to find game console...");
@@ -215,6 +230,10 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
         // Configure bases for this map (attacking/defending only)
         SetupBasesForMap(mapName, attackingFaction, defendingFaction);
+
+        // Set spawn ticket amount
+        _factionTickets[attackingFaction] = _respawnTickets;
+        _factionTickets[defendingFaction] = _respawnTickets;
     }
 
     public void OnPlayerStartCarry(int playerId, CarryableObjectType carryableObject)
@@ -283,11 +302,25 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
     public void OnUpdateElapsedTime(float time)
     {
+        _elapsedTime = time;
         _elapsedSeconds = (int)time;
 
+        // Drain pending teleports
+        for (int i = _pendingTeleports.Count - 1; i >= 0; i--)
+        {
+            var pending = _pendingTeleports[i];
+            if (_elapsedTime >= pending.FireAtTime)
+            {
+                CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
+                    "teleport {0} {1},{2},{3}",
+                    pending.PlayerId, pending.Position.x, pending.Position.y, pending.Position.z));
+                _pendingTeleports.RemoveAt(i);
+            }
+        }
+
+        // Flag capture countdown logic
         foreach (var flag in _flags)
         {
-            // Determine enemy faction and base zone for this flag
             var enemyFaction = GetOpponentFaction(flag.FlagFaction);
             if (enemyFaction == FactionCountry.None)
                 continue;
@@ -295,11 +328,9 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             if (!_basesByFaction.TryGetValue(enemyFaction, out var enemyBase))
                 continue;
 
-            // Where is the flag right now (object or carrier)?
             var flagPos = GetFlagPosition(flag);
             bool inEnemyBase = IsWithinBase(flagPos, enemyBase);
 
-            // Is it being carried by its own faction?
             bool carriedByOwner = false;
             if (flag.CarrierPlayerId != 0 &&
                 _players.TryGetValue(flag.CarrierPlayerId, out var carrier) &&
@@ -309,59 +340,55 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 carriedByOwner = true;
             }
 
-            // For countdown purposes, treat the flag as "threatening" only if:
-            // It's in the enemy base
-            // It's NOT currently carried by its own faction
             bool shouldCountAsInEnemyBase = inEnemyBase && !carriedByOwner;
 
-            // Entering enemy base (under enemy control): start countdown if not already running
             if (shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.None)
             {
                 StartBaseCountdown(flag, CaptureTimeInSeconds);
             }
-            // Either left enemy base OR is now carried by its owner in the base: cancel countdown
             else if (!shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.CountdownActive)
             {
                 Broadcast($"The {flag.FlagFaction} flag is no longer in enemy control within their spawn. Capture cancelled.");
                 CancelBaseCountdown(flag);
-                continue; // no further countdown processing this tick
+                continue;
             }
 
-            // No active countdown to update
             if (flag.baseDeadlineTime <= 0 || flag.CountdownState != FlagCountdownState.CountdownActive)
                 continue;
 
             int remaining = flag.baseDeadlineTime - _elapsedSeconds;
 
-            // Warning before round end
             if (!flag.WarningSent && remaining == WarningSeconds)
             {
                 Broadcast($"The {flag.FlagFaction} flag is in the enemy spawn under enemy control! Only {WarningSeconds} seconds to recapture it!");
                 flag.WarningSent = true;
             }
 
-            // Time expired: end round
             if (_elapsedSeconds >= flag.baseDeadlineTime)
             {
                 CtFLogger.Log("Flag base countdown reached deadline; ending round.");
 
                 if (enemyFaction != FactionCountry.None)
-                {
                     SetRoundWinner(enemyFaction);
-                }
                 else
-                {
                     CtFLogger.Warn($"Could not determine opponent faction for {flag.FlagFaction}");
-                }
 
                 flag.CountdownState = FlagCountdownState.RoundEnded;
             }
         }
 
+        // Respawn wave
         if (_elapsedSeconds - _lastRespawnWaveTime >= _respawnWaveTimerSeconds)
         {
             _lastRespawnWaveTime = _elapsedSeconds;
             WaveRespawn();
+        }
+
+        // Flag location broadcast
+        if (_elapsedSeconds - _lastFlagLocationBroadcastTime >= _flagLocationIntervalSeconds)
+        {
+            _lastFlagLocationBroadcastTime = _elapsedSeconds;
+            BroadcastFlagLocations();
         }
     }
 
@@ -457,6 +484,34 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                         }
                         break;
                     }
+
+                case "flaglocationtimer":
+                    {
+                        if (int.TryParse(arg, out var seconds) && seconds > 0)
+                        {
+                            _flagLocationIntervalSeconds = seconds;
+                            CtFLogger.Log($"FlagLocationTimer set to {_flagLocationIntervalSeconds} seconds.");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid FlagLocationTimer value '{arg}'. Must be a positive integer.");
+                        }
+                        break;
+                    }
+
+                case "respawntickets":
+                    {
+                        if (int.TryParse(arg, out var tickets) && tickets > 0)
+                        {
+                            _respawnTickets = tickets;
+                            CtFLogger.Log($"RespawnTickets set to {_respawnTickets}.");
+                        }
+                        else
+                        {
+                            CtFLogger.Warn($"Invalid RespawnTickets value '{arg}'. Must be a positive integer.");
+                        }
+                        break;
+                    }
             }
         }
     }
@@ -466,9 +521,12 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     {
         _elapsedSeconds = 0;
         _lastRespawnWaveTime = 0;
+        _lastFlagLocationBroadcastTime = 0;
 
         _flags.Clear();
         _basesByFaction.Clear();
+        _factionTickets.Clear();
+        _pendingTeleports.Clear();
 
         _roundDetails = null;
     }
@@ -653,6 +711,9 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             if (!_players.TryGetValue(flag.CarrierPlayerId, out var carrier)) continue;
             if (carrier.Faction != flag.FlagFaction) continue;
 
+            if (!_factionTickets.TryGetValue(flag.FlagFaction, out var tickets) || tickets <= 0)
+                continue;
+
             var flagPos = GetFlagPosition(flag);
             int revivedCount = 0;
 
@@ -661,25 +722,115 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 var player = kvp.Value;
                 if (player.Faction != flag.FlagFaction) continue;
                 if (player.IsAlive) continue;
+                if (tickets <= 0) break;
 
                 CommandExecutor.ExecuteCommand($"serverAdmin revive {player.PlayerId}");
 
                 var spawnPos = GetRandomSpawnAroundFlag(flagPos);
-                CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
-                    "teleport {0} {1},{2},{3}",
-                    player.PlayerId, spawnPos.x, spawnPos.y, spawnPos.z));
+                _pendingTeleports.Add(new PendingTeleport
+                {
+                    PlayerId = player.PlayerId,
+                    Position = spawnPos,
+                    FireAtTime = _elapsedTime + 0.1f
+                });
 
+                tickets--;
                 revivedCount++;
             }
 
+            _factionTickets[flag.FlagFaction] = tickets;
+
             if (revivedCount > 0)
                 _revivedFactions.Add(flag.FlagFaction);
+
+            if (tickets == 0)
+                Say($"The {flag.FlagFaction} faction has run out of respawn tickets!");
         }
 
-        if (_revivedFactions.Count == 2)
-            Broadcast("Both sides have respawned!");
-        else if (_revivedFactions.Count == 1)
-            Broadcast($"The {_revivedFactions[0]} faction has respawned!");
+        if (_revivedFactions.Count == 0) return;
+
+        var parts = new List<string>();
+        foreach (var kvp in _factionTickets)
+        {
+            _factionTickets.TryGetValue(kvp.Key, out var remaining);
+            parts.Add($"{kvp.Key}: {remaining} tickets remaining");
+        }
+
+        Say(string.Join(" | ", parts));
+    }
+
+    private void BroadcastFlagLocations()
+    {
+        if (_roundDetails == null || _flags.Count == 0) return;
+
+        CtFMapPresets.TryGetMapConfig(_roundDetails.MapName, out var cfg);
+
+        // Remap sentinel spawn POI names to actual faction names
+        var pois = new PointOfInterest[cfg.POIs.Length];
+        for (int i = 0; i < cfg.POIs.Length; i++)
+        {
+            var poi = cfg.POIs[i];
+            if (poi.Name.Equals("Attacker Spawn", StringComparison.OrdinalIgnoreCase))
+                pois[i] = new PointOfInterest($"{_roundDetails.AttackingFaction} Spawn", poi.Center, poi.Radius);
+            else if (poi.Name.Equals("Defending Spawn", StringComparison.OrdinalIgnoreCase))
+                pois[i] = new PointOfInterest($"{_roundDetails.DefendingFaction} Spawn", poi.Center, poi.Radius);
+            else
+                pois[i] = poi;
+        }
+
+        var parts = new string[_flags.Count];
+        for (int i = 0; i < _flags.Count; i++)
+        {
+            var flag = _flags[i];
+            var pos = GetFlagPosition(flag);
+            parts[i] = $"{flag.FlagFaction} Flag: {GetFlagLocationString(pos, cfg)}";
+        }
+
+        Broadcast(string.Join(" | ", parts));
+    }
+
+    private static string GetFlagLocationString(Vector3 flagPos, MapConfig cfg)
+    {
+        var pos2D = new Vector2(flagPos.x, flagPos.z);
+
+        if (cfg.POIs != null && cfg.POIs.Length > 0)
+        {
+            string closestName = null;
+            float closestDist = float.MaxValue;
+
+            foreach (var poi in cfg.POIs)
+            {
+                float dist = Vector2.Distance(pos2D, poi.Center);
+                if (dist <= poi.Radius && dist < closestDist)
+                {
+                    closestDist = dist;
+                    closestName = poi.Name;
+                }
+            }
+
+            if (closestName != null)
+                return $"Near {closestName}";
+        }
+
+        if (pos2D.magnitude <= 50f)
+            return "Center Map";
+
+        return GetCompassDirection(flagPos);
+    }
+
+    private static string GetCompassDirection(Vector3 pos)
+    {
+        float angle = Mathf.Atan2(pos.x, pos.z) * Mathf.Rad2Deg;
+        if (angle < 0f) angle += 360f;
+
+        if (angle < 22.5f || angle >= 337.5f) return "North";
+        if (angle < 67.5f) return "North East";
+        if (angle < 112.5f) return "East";
+        if (angle < 157.5f) return "South East";
+        if (angle < 202.5f) return "South";
+        if (angle < 247.5f) return "South West";
+        if (angle < 292.5f) return "West";
+        return "North West";
     }
 
     private static Vector3 GetRandomSpawnAroundFlag(Vector3 flagPos)
@@ -692,6 +843,11 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         float y = TerrainSampler.SampleTerrain(new Vector2(x, z));
 
         return new Vector3(x, y, z);
+    }
+
+    private void Say(string message)
+    {
+        CommandExecutor.ExecuteCommand("serverAdmin say " + message);
     }
 
     //Unused interface methods

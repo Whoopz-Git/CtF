@@ -4,19 +4,36 @@ using UnityEngine;
 
 namespace CtF
 {
+    public readonly struct PointOfInterest
+    {
+        public readonly string Name;
+        public readonly Vector2 Center; // XZ only
+        public readonly float Radius;
+
+        public PointOfInterest(string name, Vector2 center, float radius)
+        {
+            Name = name;
+            Center = center;
+            Radius = radius;
+        }
+    }
+
     public readonly struct MapConfig
     {
         public readonly Vector3 AttackingBase;
         public readonly Vector3 DefendingBase;
         public readonly float Radius;
+        public readonly PointOfInterest[] POIs;
 
-        public MapConfig(Vector3 attackingBase, Vector3 defendingBase, float radius)
+        public MapConfig(Vector3 attackingBase, Vector3 defendingBase, float radius, PointOfInterest[] pois = null)
         {
             AttackingBase = attackingBase;
             DefendingBase = defendingBase;
             Radius = radius;
+            POIs = pois ?? Array.Empty<PointOfInterest>();
         }
     }
+
     public static class CtFMapPresets
     {
         // Case-insensitive lookup by map name.
@@ -189,7 +206,21 @@ namespace CtF
                 new MapConfig(
                     attackingBase: new Vector3(-118.52f, 8.30f, -150.19f),
                     defendingBase: new Vector3(108.78f, 12.00f, 174.94f),
-                    radius: 25f
+                    radius: 25f,
+                    pois: new[]
+                    {
+                        new PointOfInterest("Attacker Spawn", new Vector2(-118.52f, -150.19f), 30f),
+                        new PointOfInterest("Defending Spawn", new Vector2(108.78f, 174.94f), 30f),
+                        new PointOfInterest("Ruins",    new Vector2(-116.37f,  99.86f), 40.48f),
+                        new PointOfInterest("Rotunda",  new Vector2(-131.01f,  77.78f), 10.06f),
+                        new PointOfInterest("Oasis",    new Vector2(  35.32f,  -1.93f), 29.87f),
+                        new PointOfInterest("Oasis",    new Vector2( -68.04f,  27.96f), 17.22f),
+                        new PointOfInterest("Oasis",    new Vector2( -32.16f,  31.43f), 27.10f),
+                        new PointOfInterest("Temple",   new Vector2(-124.08f, 127.82f), 29.89f),
+                        new PointOfInterest("Aqueduct", new Vector2( 101.44f,-105.59f), 30.77f),
+                        new PointOfInterest("Aqueduct", new Vector2( 135.56f,-107.14f), 29.34f),
+                        new PointOfInterest("Aqueduct", new Vector2( 187.25f,-109.13f), 31.75f),
+                    }
                 )
             },
 
