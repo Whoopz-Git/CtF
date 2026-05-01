@@ -783,22 +783,22 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         {
             var flag = _flags[i];
             var pos = GetFlagPosition(flag);
-            parts[i] = $"{flag.FlagFaction} Flag: {GetFlagLocationString(pos, cfg)}";
+            parts[i] = $"{flag.FlagFaction} Flag: {GetFlagLocationString(pos, pois)}";
         }
 
         Broadcast(string.Join(" | ", parts));
     }
 
-    private static string GetFlagLocationString(Vector3 flagPos, MapConfig cfg)
+    private static string GetFlagLocationString(Vector3 flagPos, PointOfInterest[] pois)
     {
         var pos2D = new Vector2(flagPos.x, flagPos.z);
 
-        if (cfg.POIs != null && cfg.POIs.Length > 0)
+        if (pois != null && pois.Length > 0)
         {
             string closestName = null;
             float closestDist = float.MaxValue;
 
-            foreach (var poi in cfg.POIs)
+            foreach (var poi in pois)
             {
                 float dist = Vector2.Distance(pos2D, poi.Center);
                 if (dist <= poi.Radius && dist < closestDist)
@@ -813,7 +813,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         }
 
         if (pos2D.magnitude <= 50f)
-            return "Center Map";
+            return "Map Center";
 
         return GetCompassDirection(flagPos);
     }
