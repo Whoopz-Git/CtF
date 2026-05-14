@@ -4,6 +4,7 @@ using HoldfastSharedMethods;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using UnityEngine;
 
 public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
@@ -19,7 +20,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     private int _flagLocationIntervalSeconds = 30;
     private int _lastFlagLocationBroadcastTime = 0;
 
-    private int _respawnTickets = 100;
+    private int _respawnTickets = -1;
     private readonly Dictionary<FactionCountry, int> _factionTickets = new Dictionary<FactionCountry, int>();
 
     // If set via config, overrides preset/default base radius for all maps
@@ -344,7 +345,8 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
             if (shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.None)
             {
-                StartBaseCountdown(flag, CaptureTimeInSeconds);
+                if (CaptureTimeInSeconds != -1)
+                    StartBaseCountdown(flag, CaptureTimeInSeconds);
             }
             else if (!shouldCountAsInEnemyBase && flag.CountdownState == FlagCountdownState.CountdownActive)
             {
@@ -378,14 +380,14 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         }
 
         // Respawn wave
-        if (_elapsedSeconds - _lastRespawnWaveTime >= _respawnWaveTimerSeconds)
+        if (_respawnWaveTimerSeconds != -1 && _elapsedSeconds - _lastRespawnWaveTime >= _respawnWaveTimerSeconds)
         {
             _lastRespawnWaveTime = _elapsedSeconds;
             WaveRespawn();
         }
 
         // Flag location broadcast
-        if (_elapsedSeconds - _lastFlagLocationBroadcastTime >= _flagLocationIntervalSeconds)
+        if (_flagLocationIntervalSeconds != -1 && _elapsedSeconds - _lastFlagLocationBroadcastTime >= _flagLocationIntervalSeconds)
         {
             _lastFlagLocationBroadcastTime = _elapsedSeconds;
             BroadcastFlagLocations();
@@ -416,7 +418,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             {
                 case "capturetime":
                     {
-                        if (int.TryParse(arg, out var seconds) && seconds > 0)
+                        if (int.TryParse(arg, out var seconds) && (seconds > 0 || seconds == -1))
                         {
                             CaptureTimeInSeconds = seconds;
                             CtFLogger.Log($"CaptureTime set to {CaptureTimeInSeconds} seconds.");
@@ -473,7 +475,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
                 case "respawntimer":
                     {
-                        if (int.TryParse(arg, out var seconds) && seconds > 0)
+                        if (int.TryParse(arg, out var seconds) && (seconds > 0 || seconds == -1))
                         {
                             _respawnWaveTimerSeconds = seconds;
                             CtFLogger.Log($"RespawnTimer set to {_respawnWaveTimerSeconds} seconds.");
@@ -487,7 +489,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
                 case "flaglocationtimer":
                     {
-                        if (int.TryParse(arg, out var seconds) && seconds > 0)
+                        if (int.TryParse(arg, out var seconds) && (seconds > 0 || seconds == -1))
                         {
                             _flagLocationIntervalSeconds = seconds;
                             CtFLogger.Log($"FlagLocationTimer set to {_flagLocationIntervalSeconds} seconds.");
@@ -501,14 +503,14 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
                 case "respawntickets":
                     {
-                        if (int.TryParse(arg, out var tickets) && tickets > 0)
+                        if (int.TryParse(arg, out var tickets) && (tickets > 0 || tickets == -1))
                         {
                             _respawnTickets = tickets;
                             CtFLogger.Log($"RespawnTickets set to {_respawnTickets}.");
                         }
                         else
                         {
-                            CtFLogger.Warn($"Invalid RespawnTickets value '{arg}'. Must be a positive integer.");
+                            CtFLogger.Warn($"Invalid RespawnTickets value '{arg}'. Must be a positive integer or -1 for infinite.");
                         }
                         break;
                     }
@@ -568,9 +570,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
     private void SetupBasesForMap(string mapName, FactionCountry attackingFaction, FactionCountry defendingFaction)
     {
-        CtF.MapConfig cfg;
-        bool hasPreset = CtFMapPresets.TryGetMapConfig(mapName, out cfg);
-
+        bool hasPreset = CtFMapPresets.TryGetMapConfig(mapName, out MapConfig cfg);
         float radius = _baseRadiusOverride ?? (hasPreset ? cfg.Radius : DefaultBaseRadius);
 
         Vector3 attackingPos;
@@ -711,8 +711,8 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             if (!_players.TryGetValue(flag.CarrierPlayerId, out var carrier)) continue;
             if (carrier.Faction != flag.FlagFaction) continue;
 
-            if (!_factionTickets.TryGetValue(flag.FlagFaction, out var tickets) || tickets <= 0)
-                continue;
+            if (!_factionTickets.TryGetValue(flag.FlagFaction, out var tickets)) continue;
+            if (tickets == 0) continue;
 
             var flagPos = GetFlagPosition(flag);
             int revivedCount = 0;
@@ -722,7 +722,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 var player = kvp.Value;
                 if (player.Faction != flag.FlagFaction) continue;
                 if (player.IsAlive) continue;
-                if (tickets <= 0) break;
+                if (tickets == 0) break;
 
                 CommandExecutor.ExecuteCommand($"serverAdmin revive {player.PlayerId}");
 
@@ -734,29 +734,39 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                     FireAtTime = _elapsedTime + 0.1f
                 });
 
-                tickets--;
+                if (tickets != -1)
+                {
+                    tickets--;
+                    if (tickets == 0)
+                    {
+                        _factionTickets[flag.FlagFaction] = tickets;
+                        Say($"The {flag.FlagFaction} faction has run out of respawn tickets!");
+                    }
+                }
+
                 revivedCount++;
             }
 
-            _factionTickets[flag.FlagFaction] = tickets;
+            if (tickets != -1)
+                _factionTickets[flag.FlagFaction] = tickets;
 
             if (revivedCount > 0)
                 _revivedFactions.Add(flag.FlagFaction);
-
-            if (tickets == 0)
-                Say($"The {flag.FlagFaction} faction has run out of respawn tickets!");
         }
 
         if (_revivedFactions.Count == 0) return;
 
-        var parts = new List<string>();
-        foreach (var kvp in _factionTickets)
+        if (_factionTickets.Any(kvp => kvp.Value != -1))
         {
-            _factionTickets.TryGetValue(kvp.Key, out var remaining);
-            parts.Add($"{kvp.Key}: {remaining} tickets remaining");
-        }
+            var parts = new List<string>();
+            foreach (var kvp in _factionTickets)
+            {
+                var ticketDisplay = kvp.Value == -1 ? "Infinite" : kvp.Value.ToString();
+                parts.Add($"{kvp.Key}: {ticketDisplay} tickets remaining");
+            }
 
-        Say(string.Join(" | ", parts));
+            Say(string.Join(" | ", parts));
+        }
     }
 
     private void BroadcastFlagLocations()
