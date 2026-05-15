@@ -6,11 +6,33 @@ namespace CtF
     {
         public static float SampleTerrain(Vector2 position)
         {
-            if (Physics.Raycast(new Vector3(position.x, 1000f, position.y), Vector3.down, out RaycastHit hitInfo, 2000f))
+            var terrains = Terrain.activeTerrains;
+            float terrainY = 0f;
+
+            if (terrains != null && terrains.Length > 0)
+            {
+                float highestY = float.MinValue;
+
+                foreach (var terrain in terrains)
+                {
+                    if (terrain == null) continue;
+
+                    float sampledY = terrain.SampleHeight(new Vector3(position.x, 0, position.y)) + terrain.GetPosition().y;
+
+                    if (sampledY > highestY)
+                        highestY = sampledY;
+                }
+
+                terrainY = highestY;
+            }
+
+            float rayOriginY = terrainY + 20f;
+
+            if (Physics.Raycast(new Vector3(position.x, rayOriginY, position.y), Vector3.down, out RaycastHit hitInfo, 40f))
                 return hitInfo.point.y;
 
-            CtFLogger.Warn($"Could not find terrain height at ({position.x}, {position.y}). Defaulting to Y = 0.");
-            return 0f;
+            CtFLogger.Warn($"Could not find surface height at ({position.x}, {position.y}). Falling back to terrain height.");
+            return terrainY;
         }
     }
 }
