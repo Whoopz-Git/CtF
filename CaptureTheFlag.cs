@@ -130,14 +130,18 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         }
     }
 
-    private readonly List<PendingTeleport> _pendingTeleports = new List<PendingTeleport>();
     private float _elapsedTime; // raw float, kept alongside _elapsedSeconds
 
-    private struct PendingTeleport
+    private struct ScheduledCommand
     {
-        public int PlayerId;
-        public Vector3 Position;
-        public float FireAtTime;
+        public float ReadyAt;   // earliest _elapsedTime at which this may run (0 = ASAP)
+        public Action Run;
+    }
+    private readonly Queue<ScheduledCommand> _commandQueue = new Queue<ScheduledCommand>();
+
+    private void EnqueueCommand(Action run, float readyAt = 0f)
+    {
+        _commandQueue.Enqueue(new ScheduledCommand { Run = run, ReadyAt = readyAt });
     }
 
     public void OnGameMethodsInitialized(IHoldfastGameMethods holdfastGameMethods)
@@ -197,17 +201,16 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         player.UniformId = uniformId;
         player.IsAlive = true;
     }
-    public void OnPlayerKilledPlayer(int killerPlayerId, int victimPlayerId, EntityHealthChangedReason reason, string additionalDetails)
-    {
-        if (_players.TryGetValue(victimPlayerId, out var victim))
-        {
-            victim.IsAlive = false;
-        }
-    }
 
     public void OnPlayerLeft(int playerId)
     {
         _players.Remove(playerId);
+    }
+
+    public void OnPlayerHurt(int playerId, byte oldHp, byte newHp, EntityHealthChangedReason reason)
+    {
+        if (newHp <= 0 && _players.TryGetValue(playerId, out var player))
+            player.IsAlive = false;
     }
 
     public void OnRoundDetails(int roundId, string serverName, string mapName, FactionCountry attackingFaction, FactionCountry defendingFaction, GameplayMode gameplayMode, GameType gameType)
@@ -306,17 +309,13 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         _elapsedTime = time;
         _elapsedSeconds = (int)time;
 
-        // Drain pending teleports
-        for (int i = _pendingTeleports.Count - 1; i >= 0; i--)
+        // Process queued commands: at most one per tick, and only once it's due.
+        // FIFO order matches ReadyAt order within a wave (revives are all ASAP and
+        // drain first; teleports are appended as their revives fire), so if the
+        // front entry isn't due yet, nothing behind it is either — waiting is correct.
+        if (_commandQueue.Count > 0 && _elapsedTime >= _commandQueue.Peek().ReadyAt)
         {
-            var pending = _pendingTeleports[i];
-            if (_elapsedTime >= pending.FireAtTime)
-            {
-                CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
-                    "teleport {0} {1},{2},{3}",
-                    pending.PlayerId, pending.Position.x, pending.Position.y, pending.Position.z));
-                _pendingTeleports.RemoveAt(i);
-            }
+            _commandQueue.Dequeue().Run();
         }
 
         // Flag capture countdown logic
@@ -379,8 +378,11 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             }
         }
 
-        // Respawn wave
-        if (_respawnWaveTimerSeconds != -1 && _elapsedSeconds - _lastRespawnWaveTime >= _respawnWaveTimerSeconds)
+        // Respawn wave: only start once the previous wave's commands have fully
+        // drained. This is what prevents waves stacking and bounds the command load.
+        if (_respawnWaveTimerSeconds != -1
+            && _commandQueue.Count == 0
+            && _elapsedSeconds - _lastRespawnWaveTime >= _respawnWaveTimerSeconds)
         {
             _lastRespawnWaveTime = _elapsedSeconds;
             WaveRespawn();
@@ -528,7 +530,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         _flags.Clear();
         _basesByFaction.Clear();
         _factionTickets.Clear();
-        _pendingTeleports.Clear();
+        _commandQueue.Clear();
 
         _roundDetails = null;
     }
@@ -715,7 +717,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             if (tickets == 0) continue;
 
             var flagPos = GetFlagPosition(flag);
-            int revivedCount = 0;
+            int queuedCount = 0;
 
             foreach (var kvp in _players)
             {
@@ -724,14 +726,24 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 if (player.IsAlive) continue;
                 if (tickets == 0) break;
 
-                CommandExecutor.ExecuteCommand($"serverAdmin revive {player.PlayerId}");
-
-                var spawnPos = GetRandomSpawnAroundFlag(flagPos);
-                _pendingTeleports.Add(new PendingTeleport
+                int pid = player.PlayerId;
+                EnqueueCommand(() =>
                 {
-                    PlayerId = player.PlayerId,
-                    Position = spawnPos,
-                    FireAtTime = _elapsedTime + 0.1f
+                    // Player may have left or already respawned by drain time
+                    if (!_players.TryGetValue(pid, out var p) || p.IsAlive)
+                        return;
+
+                    CommandExecutor.ExecuteCommand($"serverAdmin revive {pid}");
+
+                    // Teleport is queued behind the revive with a 0.1s minimum gap.
+                    // Spawn (raycast) is computed here, at revive-fire time, so it's
+                    // one raycast per tick rather than a burst at wave time.
+                    var spawnPos = GetRandomSpawnAroundFlag(flagPos);
+                    EnqueueCommand(() =>
+                        CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
+                            "teleport {0} {1},{2},{3}",
+                            pid, spawnPos.x, spawnPos.y, spawnPos.z)),
+                        _elapsedTime + 0.1f);
                 });
 
                 if (tickets != -1)
@@ -744,13 +756,13 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                     }
                 }
 
-                revivedCount++;
+                queuedCount++;
             }
 
             if (tickets != -1)
                 _factionTickets[flag.FlagFaction] = tickets;
 
-            if (revivedCount > 0)
+            if (queuedCount > 0)
                 _revivedFactions.Add(flag.FlagFaction);
         }
 
@@ -764,7 +776,6 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
                 var ticketDisplay = kvp.Value == -1 ? "Infinite" : kvp.Value.ToString();
                 parts.Add($"{kvp.Key}: {ticketDisplay} tickets remaining");
             }
-
             Say(string.Join(" | ", parts));
         }
     }
@@ -861,10 +872,10 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     }
 
     //Unused interface methods
+    public void OnPlayerKilledPlayer(int killerPlayerId, int victimPlayerId, EntityHealthChangedReason reason, string additionalDetails) { }
     public void OnInteractableObjectInteraction(int playerId, int interactableObjectId, GameObject interactableObject, InteractionActivationType interactionActivationType, int nextActivationStateTransitionIndex) { }
     public void OnPlayerBlock(int attackingPlayerId, int defendingPlayerId) { }
     public void OnScorableAction(int playerId, int score, ScorableActionType reason) { }
-    public void OnPlayerHurt(int playerId, byte oldHp, byte newHp, EntityHealthChangedReason reason) { }
     public void OnIsClient(bool client, ulong steamId) { }
     public void OnUpdateTimeRemaining(float time) { }
     public void OnPlayerWeaponSwitch(int playerId, string weapon) { }
