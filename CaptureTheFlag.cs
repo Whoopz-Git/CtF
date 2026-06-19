@@ -13,6 +13,13 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
     private const int WarningSeconds = 30;
     private const float DefaultBaseRadius = 30f;
 
+    // Formation spawn layout (XZ units around the flag carrier)
+    private const float SpawnSlotSpacing = 0.55f;      // spacing between adjacent players (in-game min to avoid intersection)
+    private const float SpawnRingSpacing = 1.0f;       // radial gap between concentric loner rings
+    private const float SpawnInnerStartRadius = 2.0f;  // first ring radius for loners
+    private const float SpawnZoneGap = 2.0f;           // gap between inner (loners) and outer (regiments)
+    private const float SpawnGroupGap = 0.0f;          // open space between regiment blocks on the outer ring
+
     private int _respawnWaveTimerSeconds = 30;
     private int _lastRespawnWaveTime = 0;
     private readonly List<FactionCountry> _revivedFactions = new List<FactionCountry>();
@@ -289,6 +296,10 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
             // Enemy picking up the flag: broadcast full capture message
             Broadcast($"The {flag.FlagFaction} flag has been captured by player {player.Name}!");
             CtFLogger.Log($"{player.Name} captured the {flag.FlagFaction} flag.");
+
+            // Instant respawn for the team whose flag was just captured, at the
+            // point the enemy must deliver it to. Normal wave cadence continues.
+            RespawnFaction(flag);
         }
 
         CtFLogger.Log($"{player.Name} is now carrying the {flag.FlagFaction} flag.");
@@ -712,75 +723,127 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
 
         foreach (var flag in _flags)
         {
-            if (flag.CarrierPlayerId == 0) continue;
-            if (!_players.TryGetValue(flag.CarrierPlayerId, out var carrier)) continue;
-            if (carrier.Faction != flag.FlagFaction) continue;
-
-            if (!_factionTickets.TryGetValue(flag.FlagFaction, out var tickets)) continue;
-            if (tickets == 0) continue;
-
-            var flagPos = GetFlagPosition(flag);
-            int queuedCount = 0;
-
-            foreach (var kvp in _players)
-            {
-                var player = kvp.Value;
-                if (player.Faction != flag.FlagFaction) continue;
-                if (player.IsAlive) continue;
-                if (tickets == 0) break;
-
-                int pid = player.PlayerId;
-                EnqueueCommand(() =>
-                {
-                    // Player may have left or already respawned by drain time
-                    if (!_players.TryGetValue(pid, out var p) || p.IsAlive)
-                        return;
-
-                    CommandExecutor.ExecuteCommand($"serverAdmin revive {pid}");
-
-                    // Teleport is queued behind the revive with a 0.1s minimum gap.
-                    // Spawn (raycast) is computed here, at revive-fire time, so it's
-                    // one raycast per tick rather than a burst at wave time.
-                    var spawnPos = GetRandomSpawnAroundFlag(flagPos);
-                    EnqueueCommand(() =>
-                        CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
-                            "teleport {0} {1},{2},{3}",
-                            pid, spawnPos.x, spawnPos.y, spawnPos.z)),
-                        _elapsedTime + 0.1f);
-                });
-
-                if (tickets != -1)
-                {
-                    tickets--;
-                    if (tickets == 0)
-                    {
-                        _factionTickets[flag.FlagFaction] = tickets;
-                        Say($"The {flag.FlagFaction} faction has run out of respawn tickets!");
-                    }
-                }
-
-                queuedCount++;
-            }
-
-            if (tickets != -1)
-                _factionTickets[flag.FlagFaction] = tickets;
-
-            if (queuedCount > 0)
+            if (RespawnFaction(flag))
                 _revivedFactions.Add(flag.FlagFaction);
         }
 
         if (_revivedFactions.Count == 0) return;
 
-        if (_factionTickets.Any(kvp => kvp.Value != -1))
+        ReportTicketsRemaining();
+    }
+
+    // Revives a faction's dead players (bounded by tickets) and teleports them
+    // into a formation around the faction's current spawn anchor. Returns true if
+    // at least one revive was queued. Used both by the wave timer and for the
+    // instant respawn fired the moment a faction's flag is captured.
+    private bool RespawnFaction(FlagState flag)
+    {
+        var faction = flag.FlagFaction;
+
+        if (!_factionTickets.TryGetValue(faction, out var tickets)) return false;
+        if (tickets == 0) return false;
+
+        var anchor = GetFactionSpawnAnchor(flag);
+
+        // Gather the dead players we will revive, bounded by tickets.
+        var toRevive = new List<int>();
+        foreach (var kvp in _players)
         {
-            var parts = new List<string>();
-            foreach (var kvp in _factionTickets)
+            var player = kvp.Value;
+            if (player.Faction != faction) continue;
+            if (player.IsAlive) continue;
+            if (tickets == 0) break;
+
+            toRevive.Add(player.PlayerId);
+
+            if (tickets != -1)
             {
-                var ticketDisplay = kvp.Value == -1 ? "Infinite" : kvp.Value.ToString();
-                parts.Add($"{kvp.Key}: {ticketDisplay} tickets remaining");
+                tickets--;
+                if (tickets == 0)
+                    Say($"The {faction} faction has run out of respawn tickets!");
             }
-            Say(string.Join(" | ", parts));
         }
+
+        if (tickets != -1)
+            _factionTickets[faction] = tickets;
+
+        if (toRevive.Count == 0) return false;
+
+        // Assign every reviving player an XZ slot up front (cheap math, no
+        // raycasts) so regiments form cohesive blocks. The terrain Y for each
+        // slot is sampled later, at revive-fire time, keeping it to one raycast
+        // per tick rather than a burst of ~50-60 at wave time.
+        var formation = BuildFormation(toRevive, new Vector2(anchor.x, anchor.z));
+
+        foreach (var pid in toRevive)
+        {
+            if (!formation.TryGetValue(pid, out var slot))
+                continue;
+
+            EnqueueCommand(() =>
+            {
+                // Player may have left or already respawned by drain time
+                if (!_players.TryGetValue(pid, out var p) || p.IsAlive)
+                    return;
+
+                CommandExecutor.ExecuteCommand($"serverAdmin revive {pid}");
+
+                // Teleport is queued behind the revive with a 0.1s minimum gap.
+                // Y is sampled here, at revive-fire time, so it's one raycast
+                // per tick rather than a burst at wave time.
+                float y = TerrainSampler.SampleTerrain(slot);
+                EnqueueCommand(() =>
+                    CommandExecutor.ExecuteCommand(string.Format(CultureInfo.InvariantCulture,
+                        "teleport {0} {1},{2},{3}",
+                        pid, slot.x, y, slot.y)),
+                    _elapsedTime + 0.1f);
+            });
+        }
+
+        return true;
+    }
+
+    // Resolves where a faction should spawn based on its flag state:
+    //  - own flag carried by a friendly -> rally on the carrier
+    //  - own flag captured by an enemy  -> the point the enemy must deliver it to
+    //                                      (the enemy base / capture zone)
+    //  - own flag not held              -> the faction's own base
+    private Vector3 GetFactionSpawnAnchor(FlagState flag)
+    {
+        var faction = flag.FlagFaction;
+
+        if (flag.CarrierPlayerId != 0
+            && _players.TryGetValue(flag.CarrierPlayerId, out var carrier)
+            && carrier.Faction != FactionCountry.None)
+        {
+            if (carrier.Faction == faction)
+                return GetFlagPosition(flag); // friendly carrier: rally on them
+
+            // Enemy carrier: spawn at the point they must reach to capture it.
+            var enemy = GetOpponentFaction(faction);
+            if (enemy != FactionCountry.None && _basesByFaction.TryGetValue(enemy, out var enemyBase))
+                return enemyBase.Center;
+        }
+
+        // Flag not held (or anchor unresolved): default to the faction's own base.
+        if (_basesByFaction.TryGetValue(faction, out var ownBase))
+            return ownBase.Center;
+
+        return GetFlagPosition(flag);
+    }
+
+    private void ReportTicketsRemaining()
+    {
+        if (!_factionTickets.Any(kvp => kvp.Value != -1))
+            return;
+
+        var parts = new List<string>();
+        foreach (var kvp in _factionTickets)
+        {
+            var ticketDisplay = kvp.Value == -1 ? "Infinite" : kvp.Value.ToString();
+            parts.Add($"{kvp.Key}: {ticketDisplay} tickets remaining");
+        }
+        Say(string.Join(" | ", parts));
     }
 
     private void BroadcastFlagLocations()
@@ -857,16 +920,133 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         return "North West";
     }
 
-    private static Vector3 GetRandomSpawnAroundFlag(Vector3 flagPos)
+    // Builds an XZ formation around the flag: regiments (>=2 reviving members)
+    // are placed as cohesive wedges on the outer rings, while loners (no tag, or
+    // the only member of their tag this wave) fill the inner disc. Returns a map
+    // of playerId -> XZ slot. Y is sampled later, per slot, at teleport time.
+    private Dictionary<int, Vector2> BuildFormation(List<int> playerIds, Vector2 center)
     {
-        float angle = UnityEngine.Random.Range(0f, 360f) * Mathf.Deg2Rad;
-        float radius = UnityEngine.Random.Range(1f, 5f);
+        var result = new Dictionary<int, Vector2>(playerIds.Count);
 
-        float x = flagPos.x + radius * Mathf.Cos(angle);
-        float z = flagPos.z + radius * Mathf.Sin(angle);
-        float y = TerrainSampler.SampleTerrain(new Vector2(x, z));
+        // Partition reviving players by regiment tag.
+        var byTag = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var loners = new List<int>();
 
-        return new Vector3(x, y, z);
+        foreach (var pid in playerIds)
+        {
+            string tag = _players.TryGetValue(pid, out var p) ? p.RegimentTag : null;
+
+            if (string.IsNullOrWhiteSpace(tag))
+            {
+                loners.Add(pid);
+                continue;
+            }
+
+            tag = tag.Trim();
+            if (!byTag.TryGetValue(tag, out var list))
+            {
+                list = new List<int>();
+                byTag[tag] = list;
+            }
+            list.Add(pid);
+        }
+
+        // A regiment needs at least two reviving members to form a group;
+        // anyone else falls back to the inner disc.
+        var groups = new List<List<int>>();
+        foreach (var kvp in byTag)
+        {
+            if (kvp.Value.Count >= 2)
+                groups.Add(kvp.Value);
+            else
+                loners.Add(kvp.Value[0]);
+        }
+
+        // Inner disc: loners packed into concentric rings from the flag outward.
+        float innerEnd = SpawnInnerStartRadius;
+        if (loners.Count > 0)
+            innerEnd = FillConcentricRings(loners, center, SpawnInnerStartRadius, result);
+
+        if (groups.Count == 0)
+            return result;
+
+        // Outer ring: each regiment is packed into a tight square-ish block so its
+        // members spawn right next to each other, and the blocks are spread evenly
+        // around the ring with generous open space between them.
+        float outerStart = loners.Count > 0 ? innerEnd + SpawnZoneGap : SpawnInnerStartRadius;
+
+        // Pick a ring radius big enough that the widest block plus the inter-group
+        // gap fits inside each group's angular slice, so blocks never collide.
+        float maxBlockWidth = 0f;
+        foreach (var g in groups)
+        {
+            float w = GroupColumns(g.Count) * SpawnSlotSpacing;
+            if (w > maxBlockWidth) maxBlockWidth = w;
+        }
+
+        float minRadius = groups.Count * (maxBlockWidth + SpawnGroupGap) / (2f * Mathf.PI);
+        float clusterRadius = Mathf.Max(outerStart, minRadius);
+
+        float angleStep = 360f / groups.Count;
+        for (int i = 0; i < groups.Count; i++)
+            PlaceGroupCluster(groups[i], center, clusterRadius, i * angleStep, result);
+
+        return result;
+    }
+
+    // Columns for a compact, roughly square block of n members.
+    private static int GroupColumns(int n)
+    {
+        return Mathf.Max(1, Mathf.CeilToInt(Mathf.Sqrt(n)));
+    }
+
+    // Packs players into concentric rings around 'center' starting at
+    // 'startRadius', filling each ring to capacity before stepping outward.
+    // Returns the radius of the next free ring.
+    private static float FillConcentricRings(List<int> players, Vector2 center, float startRadius, Dictionary<int, Vector2> result)
+    {
+        int idx = 0;
+        float radius = startRadius;
+
+        while (idx < players.Count)
+        {
+            int capacity = Mathf.Max(1, Mathf.FloorToInt((2f * Mathf.PI * radius) / SpawnSlotSpacing));
+            int count = Mathf.Min(capacity, players.Count - idx);
+            float stepDeg = 360f / count;
+
+            for (int i = 0; i < count; i++, idx++)
+            {
+                float ang = (i * stepDeg) * Mathf.Deg2Rad;
+                float x = center.x + radius * Mathf.Cos(ang);
+                float z = center.y + radius * Mathf.Sin(ang);
+                result[players[idx]] = new Vector2(x, z);
+            }
+
+            radius += SpawnRingSpacing;
+        }
+
+        return radius;
+    }
+
+    // Packs a regiment into a tight square-ish block centered on the given ring
+    // angle, growing outward row by row, so members spawn adjacent to each other.
+    private static void PlaceGroupCluster(List<int> members, Vector2 center, float clusterRadius, float angleDeg, Dictionary<int, Vector2> result)
+    {
+        int cols = GroupColumns(members.Count);
+
+        for (int k = 0; k < members.Count; k++)
+        {
+            int col = k % cols;
+            int row = k / cols;
+
+            float worldRadius = clusterRadius + row * SpawnSlotSpacing;
+            float tangential = (col - (cols - 1) * 0.5f) * SpawnSlotSpacing;
+            float angle = (angleDeg + (tangential / worldRadius) * Mathf.Rad2Deg) * Mathf.Deg2Rad;
+
+            float x = center.x + worldRadius * Mathf.Cos(angle);
+            float z = center.y + worldRadius * Mathf.Sin(angle);
+            result[members[k]] = new Vector2(x, z);
+        }
     }
 
     private void Say(string message)
