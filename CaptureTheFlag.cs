@@ -269,26 +269,29 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         flag.CarrierPlayerId = playerId;
 
         // Look up player for logging / capture decisions
-        if (_players.TryGetValue(playerId, out var player) && player.Faction != FactionCountry.None)
+        if (!_players.TryGetValue(playerId, out var player) || player == null)
         {
-            if (player.Faction == flag.FlagFaction)
-            {
-                // Friendly picking up their own flag
-                CtFLogger.Log($"{player.Name} picked up their own {flag.FlagFaction} flag.");
-            }
-            else
-            {
-                // Enemy picking up the flag: broadcast full capture message
-                Broadcast($"The {flag.FlagFaction} flag has been captured by player {player.Name}!");
-                CtFLogger.Log($"{player.Name} captured the {flag.FlagFaction} flag.");
-            }
+            CtFLogger.Warn($"Player {playerId} picked up the {flag.FlagFaction} flag but is not known.");
+            return;
+        }
+
+        if (player.Faction == FactionCountry.None)
+        {
+            CtFLogger.Warn($"{player.Name} picked up the {flag.FlagFaction} flag but their faction is unknown.");
+        }
+        else if (player.Faction == flag.FlagFaction)
+        {
+            // Friendly picking up their own flag
+            CtFLogger.Log($"{player.Name} picked up their own {flag.FlagFaction} flag.");
         }
         else
         {
-            CtFLogger.Warn($"{player.Name} picked up {flag.FlagFaction} flag but faction is unknown.");
+            // Enemy picking up the flag: broadcast full capture message
+            Broadcast($"The {flag.FlagFaction} flag has been captured by player {player.Name}!");
+            CtFLogger.Log($"{player.Name} captured the {flag.FlagFaction} flag.");
         }
 
-        CtFLogger.Log($"{player.Name} is now carrying {flag.FlagFaction} flag.");
+        CtFLogger.Log($"{player.Name} is now carrying the {flag.FlagFaction} flag.");
     }
 
     public void OnPlayerEndCarry(int playerId)
@@ -312,7 +315,7 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         // Process queued commands: at most one per tick, and only once it's due.
         // FIFO order matches ReadyAt order within a wave (revives are all ASAP and
         // drain first; teleports are appended as their revives fire), so if the
-        // front entry isn't due yet, nothing behind it is either — waiting is correct.
+        // front entry isn't due yet, nothing behind it is either ï¿½ waiting is correct.
         if (_commandQueue.Count > 0 && _elapsedTime >= _commandQueue.Peek().ReadyAt)
         {
             _commandQueue.Dequeue().Run();
