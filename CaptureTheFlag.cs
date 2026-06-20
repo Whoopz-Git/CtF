@@ -803,32 +803,32 @@ public class CaptureTheFlag : IHoldfastSharedMethods, IHoldfastGame
         return true;
     }
 
-    // Resolves where a faction should spawn based on its flag state:
-    //  - own flag carried by a friendly -> rally on the carrier
-    //  - own flag captured by an enemy  -> the point the enemy must deliver it to
-    //                                      (the enemy base / capture zone)
-    //  - own flag not held              -> the faction's own base
+    // Resolves where a faction should spawn based on its flag's state:
+    //  - flag held by an enemy -> the enemy's base (the point they must deliver it
+    //    to). This is the only case where a team is denied spawning on its flag.
+    //  - held by a teammate, or not held at all -> on the flag itself
     private Vector3 GetFactionSpawnAnchor(FlagState flag)
     {
         var faction = flag.FlagFaction;
 
-        if (flag.CarrierPlayerId != 0
+        bool heldByEnemy = flag.CarrierPlayerId != 0
             && _players.TryGetValue(flag.CarrierPlayerId, out var carrier)
-            && carrier.Faction != FactionCountry.None)
-        {
-            if (carrier.Faction == faction)
-                return GetFlagPosition(flag); // friendly carrier: rally on them
+            && carrier.Faction != FactionCountry.None
+            && carrier.Faction != faction;
 
-            // Enemy carrier: spawn at the point they must reach to capture it.
+        if (heldByEnemy)
+        {
+            // Spawn at the enemy's base: the point they must deliver the flag to.
             var enemy = GetOpponentFaction(faction);
             if (enemy != FactionCountry.None && _basesByFaction.TryGetValue(enemy, out var enemyBase))
                 return enemyBase.Center;
+
+            // Defensive fallback if bases aren't configured: use our own base.
+            if (_basesByFaction.TryGetValue(faction, out var ownBase))
+                return ownBase.Center;
         }
 
-        // Flag not held (or anchor unresolved): default to the faction's own base.
-        if (_basesByFaction.TryGetValue(faction, out var ownBase))
-            return ownBase.Center;
-
+        // Held by a teammate, or not held at all: spawn on the flag itself.
         return GetFlagPosition(flag);
     }
 
